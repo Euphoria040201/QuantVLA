@@ -49,12 +49,12 @@ echo "Port: 5556"
 echo "Denoising Steps: $DENOISING_STEPS"
 echo "=========================================="
 
-cd /home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T
+cd /home/xinyu/QuantVLA
 
 python scripts/inference_service.py \
     --model_path $MODEL_PATH \
     --server \
     --data_config $DATA_CONFIG \
-    --denoising-steps 8 \
+    --denoising-steps $DENOISING_STEPS \
     --port 5556 \
     --embodiment-tag new_embodiment

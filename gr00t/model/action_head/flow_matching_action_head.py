@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -22,6 +24,7 @@ from torch.distributions import Beta
 from transformers import PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
 
+from gr00t.atm.dit_atm import set_atm_ohb_group, step_to_group
 from gr00t.model.action_head.action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
@@ -79,9 +82,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
         # 1) Expand each batch's single scalar time 'tau' across all T steps
         #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
         else:
             raise ValueError(
@@ -232,7 +233,6 @@ class FlowmatchingActionHead(nn.Module):
             self.model.requires_grad_(False)
         print(f"Tune action head projector: {self.tune_projector}")
         print(f"Tune action head diffusion model: {self.tune_diffusion_model}")
-        # Check if any parameters are still trainable. If not, print a warning.
         if not tune_projector and not tune_diffusion_model:
             for name, p in self.named_parameters():
                 if p.requires_grad:
@@ -241,11 +241,6 @@ class FlowmatchingActionHead(nn.Module):
             print("Warning: No action head trainable parameters found.")
 
     def set_frozen_modules_to_eval_mode(self):
-        """
-        Huggingface will call model.train() at each training_step. To ensure
-        the expected behaviors for modules like dropout, batchnorm, etc., we
-        need to call model.eval() for the frozen modules.
-        """
         if self.training:
             if not self.tune_projector:
                 self.state_encoder.eval()
@@ -271,7 +266,6 @@ class FlowmatchingActionHead(nn.Module):
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-        # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
         backbone_output = self.process_backbone_output(backbone_output)
@@ -283,8 +277,7 @@ class FlowmatchingActionHead(nn.Module):
                 while len(factors) < ndim:
                     factors.append(1)
                 factors = tuple(factors)
-                expanded = v.repeat(*factors)
-                backbone_output[k] = expanded
+                backbone_output[k] = v.repeat(*factors)
 
             for k, v in action_input.items():
                 ndim = len(v.shape)
@@ -292,39 +285,30 @@ class FlowmatchingActionHead(nn.Module):
                 while len(factors) < ndim:
                     factors.append(1)
                 factors = tuple(factors)
-                expanded = v.repeat(*factors)
-                action_input[k] = expanded
+                action_input[k] = v.repeat(*factors)
 
-        # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
         device = vl_embs.device
-
-        # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
-        # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
-        # Embed noised action trajectory.
         actions = action_input.action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        t = t[:, None, None]
 
         noisy_trajectory = (1 - t) * noise + t * actions
         velocity = actions - noise
 
-        # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
-        # Maybe add position embedding.
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
 
-        # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
@@ -335,33 +319,25 @@ class FlowmatchingActionHead(nn.Module):
             encoder_hidden_states=vl_embs,
             encoder_attention_mask=vl_attn_mask,
             timestep=t_discretized,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            return_all_hidden_states=False,
         )
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
-        output_dict = {
-            "loss": loss,
-        }
-        return BatchFeature(data=output_dict)
+        return BatchFeature(data={"loss": loss})
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
         embodiment_id = action_input.embodiment_id
 
-        # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
-        # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
@@ -373,27 +349,47 @@ class FlowmatchingActionHead(nn.Module):
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
+        # ---------- GROUPED ATM/OHB: load group_edges once ----------
+        group_edges = getattr(self.model, "_atm_group_edges", None)
+        if group_edges is None:
+            alpha_path = os.environ.get("GR00T_ATM_ALPHA_PATH")
+            if alpha_path and os.path.exists(alpha_path):
+                try:
+                    with open(alpha_path, "r", encoding="utf-8") as f:
+                        _data = json.load(f)
+                    group_edges = _data.get("group_edges", None)
+                except Exception:
+                    group_edges = None
+            if group_edges is not None:
+                setattr(self.model, "_atm_group_edges", group_edges)
+
+        prev_gid = None
+
         # Run denoising steps.
         for t in range(num_steps):
-            t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
+            # ---------- GROUPED ATM/OHB: switch group by denoising step index ----------
+            if group_edges is not None:
+                gid = step_to_group(t, list(group_edges))
+                if gid != prev_gid:
+                    # Use scope="all" because inside DiT the module names typically
+                    # do NOT have the "action_head.model." prefix.
+                    set_atm_ohb_group(self.model, gid, scope="all")
+                    prev_gid = gid
+
+            t_cont = t / float(num_steps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
+            timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Maybe add position embedding.
+
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
-            # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
@@ -403,8 +399,8 @@ class FlowmatchingActionHead(nn.Module):
 
             pred_velocity = pred[:, -self.action_horizon :]
 
-            # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+
         return BatchFeature(data={"action_pred": actions})
 
     @property

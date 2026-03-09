@@ -20,7 +20,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate libero_test
 
 # Add QuantVLA_GR00T and LIBERO to Python path
-export PYTHONPATH=/home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T:/home/jz97/VLM_REPO/Isaac-GR00T/LIBERO:$PYTHONPATH
+export PYTHONPATH=/home/xinyu/QuantVLA:/home/xinyu/QuantVLA/LIBERO:$PYTHONPATH
 
 echo "=========================================="
 echo "Running Libero evaluation for $TASK"
@@ -37,6 +37,6 @@ echo "  - Videos: /tmp/logs/rollout_*.mp4"
 echo "=========================================="
 echo ""
 
-cd /home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T/examples/Libero/eval
+cd /home/xinyu/QuantVLA/examples/Libero/eval
 
 python run_libero_eval.py --task_suite_name "$TASK" --port 5556 "${EXTRA_ARGS[@]}"

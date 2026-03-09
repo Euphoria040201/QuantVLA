@@ -1,8 +1,9 @@
+import bisect
 import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -35,6 +36,51 @@ def _is_dit_attention(name: str, module: Attention, scope: str = "dit") -> bool:
     if scope == "all":
         return True
     return scope in name
+
+
+def _is_2d_list(x) -> bool:
+    """True if x looks like list[list[...]]."""
+    return isinstance(x, list) and len(x) > 0 and isinstance(x[0], list)
+
+
+def step_to_group(step_idx: int, group_edges: Optional[list[int]]) -> int:
+    """
+    Map denoising step index -> group id using group_edges (len = G+1).
+    Example: edges [0,2,4,6,8] => groups {0,1},{2,3},{4,5},{6,7}.
+    """
+    if not group_edges or len(group_edges) < 2:
+        return 0
+    g = bisect.bisect_right(group_edges, int(step_idx)) - 1
+    return max(0, min(g, len(group_edges) - 2))
+
+
+def set_atm_ohb_group(model: torch.nn.Module, group_id: int, scope: str = "dit") -> None:
+    """
+    Switch active ATM/OHB parameters to the given group_id.
+    This expects enable_dit_atm_if_configured() has populated *_table buffers.
+    """
+    gid = int(group_id)
+    for name, module in model.named_modules():
+        if not _is_dit_attention(name, module, scope=scope):
+            continue
+
+        # ATM alpha per-head table: [G, heads]
+        alpha_tab = getattr(module, "_atm_alpha_table", None)
+        if alpha_tab is not None:
+            g = max(0, min(gid, alpha_tab.shape[0] - 1))
+            setattr(module, "_atm_alpha_all", alpha_tab[g])
+
+        # OHB per-head table: [G, heads]
+        beta_ph_tab = getattr(module, "_ohb_beta_perhead_table", None)
+        if beta_ph_tab is not None:
+            g = max(0, min(gid, beta_ph_tab.shape[0] - 1))
+            setattr(module, "_ohb_beta_perhead", beta_ph_tab[g])
+
+        # OHB scalar table: [G]
+        beta_s_tab = getattr(module, "_ohb_beta_scalar_table", None)
+        if beta_s_tab is not None:
+            g = max(0, min(gid, beta_s_tab.shape[0] - 1))
+            setattr(module, "_ohb_beta_scalar", float(beta_s_tab[g].item()))
 
 
 class _ATMProcessor(AttnProcessor2_0):
@@ -108,7 +154,7 @@ class _ATMProcessor(AttnProcessor2_0):
             if logits_capture_cb is not None:
                 logits_capture_cb(attn, logits_tensor)
 
-        # Apply ATM scaling if provided
+        # Apply ATM scaling if provided (expects shape: (heads,))
         alpha = getattr(attn, "_atm_alpha_all", None)
         if alpha is not None:
             alpha = alpha.to(dtype=query.dtype, device=query.device).view(1, -1, 1, 1)
@@ -119,7 +165,6 @@ class _ATMProcessor(AttnProcessor2_0):
         )
 
         # Capture per-head RMS for per-head OHB calibration (BEFORE reshape)
-        # hidden_states shape here: (batch, heads, seq, head_dim)
         ohb_perhead_capture_cb = getattr(attn, "_atm_ohb_perhead_capture_callback", None)
         if ohb_perhead_capture_cb is not None:
             ohb_perhead_capture_cb(attn, _compute_rms_per_head(hidden_states))
@@ -127,7 +172,6 @@ class _ATMProcessor(AttnProcessor2_0):
         # Apply per-head OHB beta scaling (BEFORE reshape)
         beta_perhead = getattr(attn, "_ohb_beta_perhead", None)
         if beta_perhead is not None:
-            # beta_perhead shape: (heads,), expand to (1, heads, 1, 1)
             beta_perhead = beta_perhead.to(dtype=hidden_states.dtype, device=hidden_states.device)
             beta_perhead = beta_perhead.view(1, -1, 1, 1)
             hidden_states = hidden_states * beta_perhead
@@ -171,7 +215,6 @@ def _compute_logits_std(
     logits = torch.matmul(query.to(dtype), key.to(dtype).transpose(-1, -2)) * scale
 
     if attention_mask is not None:
-        # attention mask is additive, with large negative entries for masked positions
         valid = attention_mask >= -1e4
     else:
         valid = torch.ones_like(logits, dtype=torch.bool)
@@ -201,16 +244,13 @@ def _compute_rms_per_head(tensor: torch.Tensor) -> torch.Tensor:
     Returns:
         Shape (heads,) - RMS value per head averaged over batch, seq, head_dim.
     """
-    # tensor shape: (batch, heads, seq, head_dim)
     t = tensor.detach().to(torch.float32)
-    # Compute RMS per head: sqrt(mean(x^2)) over (batch, seq, head_dim)
     rms_per_head = torch.sqrt(torch.mean(t ** 2, dim=(0, 2, 3)) + 1e-12)  # (heads,)
     return rms_per_head
 
 
 def ensure_dit_attention_patch(model: torch.nn.Module, scope: str = "dit") -> None:
     """Replace attention processors for DiT attention layers with ATM-enabled processor."""
-
     for name, module in model.named_modules():
         if _is_dit_attention(name, module, scope=scope):
             if getattr(module, _ATM_PATCH_FLAG, False):
@@ -261,10 +301,7 @@ def register_ohb_perhead_capture(
     callback: Callable[[str, torch.Tensor], None],
     scope: str = "dit",
 ) -> None:
-    """Register per-head OHB capture callback.
-
-    The callback receives (layer_name, rms_per_head) where rms_per_head has shape (heads,).
-    """
+    """Register per-head OHB capture callback."""
     for name, module in model.named_modules():
         if _is_dit_attention(name, module, scope=scope):
             setattr(
@@ -278,22 +315,18 @@ def register_ohb_perhead_capture(
 def clear_atm_capture(model: torch.nn.Module) -> None:
     for _, module in model.named_modules():
         if isinstance(module, Attention):
-            if hasattr(module, "_atm_capture_callback"):
-                delattr(module, "_atm_capture_callback")
-            if hasattr(module, "_atm_capture_name"):
-                delattr(module, "_atm_capture_name")
-            if hasattr(module, "_atm_logits_capture_callback"):
-                delattr(module, "_atm_logits_capture_callback")
-            if hasattr(module, "_atm_logits_capture_name"):
-                delattr(module, "_atm_logits_capture_name")
-            if hasattr(module, "_atm_ohb_capture_callback"):
-                delattr(module, "_atm_ohb_capture_callback")
-            if hasattr(module, "_atm_ohb_capture_name"):
-                delattr(module, "_atm_ohb_capture_name")
-            if hasattr(module, "_atm_ohb_perhead_capture_callback"):
-                delattr(module, "_atm_ohb_perhead_capture_callback")
-            if hasattr(module, "_atm_ohb_perhead_capture_name"):
-                delattr(module, "_atm_ohb_perhead_capture_name")
+            for attr in (
+                "_atm_capture_callback",
+                "_atm_capture_name",
+                "_atm_logits_capture_callback",
+                "_atm_logits_capture_name",
+                "_atm_ohb_capture_callback",
+                "_atm_ohb_capture_name",
+                "_atm_ohb_perhead_capture_callback",
+                "_atm_ohb_perhead_capture_name",
+            ):
+                if hasattr(module, attr):
+                    delattr(module, attr)
 
 
 @dataclass
@@ -322,11 +355,17 @@ def enable_dit_atm_if_configured(model: torch.nn.Module) -> None:
     with open(alpha_path, "r", encoding="utf-8") as f:
         alpha_data = json.load(f)
 
+    # Optional grouped config
+    group_edges = alpha_data.get("group_edges", None)
+    if group_edges is not None:
+        setattr(model, "_atm_group_edges", group_edges)
+
     scope = os.environ.get(ATM_SCOPE_ENV, "dit")
     ohb_scope = os.environ.get(OHB_SCOPE_ENV, None)
     if ohb_scope is None:
         ohb_only_dit = os.environ.get(OHB_ONLY_DIT_ENV, "1") not in ("0", "false", "False")
         ohb_scope = "dit" if ohb_only_dit else scope
+
     summary = _AlphaSummary()
     ohb_layers = 0
     ohb_fallback = float(os.environ.get(OHB_FALLBACK_ENV, "1.0"))
@@ -336,32 +375,54 @@ def enable_dit_atm_if_configured(model: torch.nn.Module) -> None:
     for name, module in model.named_modules():
         if not _is_dit_attention(name, module, scope=scope):
             continue
+
         alpha_entry = alpha_data.get(name) or alpha_data.get(name.replace("model.", "model", 1))
         if not alpha_entry:
-            beta_value = None
             alpha_values = None
+            beta_value = None
+            beta_perhead_values = None
         else:
             alpha_values = alpha_entry.get("all") or alpha_entry.get("alpha")
             beta_value = alpha_entry.get("beta")
+            beta_perhead_values = alpha_entry.get("beta_perhead")
 
+        # ---------- ATM alpha ----------
         if atm_enabled and alpha_values:
-            alpha_tensor = torch.tensor(alpha_values, dtype=torch.float32)
-            setattr(module, "_atm_alpha_all", alpha_tensor)
-            summary.matched_layers += 1
-            summary.total_heads += len(alpha_values)
+            if _is_2d_list(alpha_values):
+                # [G, heads]
+                alpha_table = torch.tensor(alpha_values, dtype=torch.float32)
+                setattr(module, "_atm_alpha_table", alpha_table)
+                setattr(module, "_atm_alpha_all", alpha_table[0])  # default group0
+                summary.matched_layers += 1
+                summary.total_heads += int(alpha_table.shape[1])
+            else:
+                # [heads]
+                alpha_tensor = torch.tensor(alpha_values, dtype=torch.float32)
+                setattr(module, "_atm_alpha_all", alpha_tensor)
+                summary.matched_layers += 1
+                summary.total_heads += len(alpha_values)
 
+        # ---------- OHB beta ----------
         if ohb_enabled and _is_dit_attention(name, module, scope=ohb_scope):
-            # Check for per-head beta first
-            beta_perhead_values = alpha_entry.get("beta_perhead") if alpha_entry else None
+            # per-head beta preferred
             if beta_perhead_values is not None:
-                # Per-head OHB
-                beta_tensor = torch.tensor(beta_perhead_values, dtype=torch.float32)
-                setattr(module, "_ohb_beta_perhead", beta_tensor)
+                if _is_2d_list(beta_perhead_values):
+                    beta_ph_table = torch.tensor(beta_perhead_values, dtype=torch.float32)  # [G, heads]
+                    setattr(module, "_ohb_beta_perhead_table", beta_ph_table)
+                    setattr(module, "_ohb_beta_perhead", beta_ph_table[0])
+                else:
+                    beta_tensor = torch.tensor(beta_perhead_values, dtype=torch.float32)  # [heads]
+                    setattr(module, "_ohb_beta_perhead", beta_tensor)
                 ohb_layers += 1
             else:
-                # Per-layer OHB (fallback)
-                beta = float(beta_value) if beta_value is not None else ohb_fallback
-                setattr(module, "_ohb_beta_scalar", beta)
+                # per-layer beta: supports [G] or scalar
+                if isinstance(beta_value, list) and len(beta_value) > 0:
+                    beta_s_table = torch.tensor(beta_value, dtype=torch.float32)  # [G]
+                    setattr(module, "_ohb_beta_scalar_table", beta_s_table)
+                    setattr(module, "_ohb_beta_scalar", float(beta_s_table[0].item()))
+                else:
+                    beta = float(beta_value) if beta_value is not None else ohb_fallback
+                    setattr(module, "_ohb_beta_scalar", beta)
                 ohb_layers += 1
 
     if summary.matched_layers == 0 and atm_enabled:
@@ -371,9 +432,13 @@ def enable_dit_atm_if_configured(model: torch.nn.Module) -> None:
             f"[GR00T-ATM] ATM enabled for {summary.matched_layers} layers "
             f"({summary.total_heads} heads) using {alpha_path}"
         )
+        if group_edges is not None:
+            print(f"[GR00T-ATM] Grouped ATM detected: group_edges={group_edges}")
 
     if ohb_enabled:
         if ohb_layers == 0:
             print(f"[GR00T-ATM] OHB requested but no layers found (scope={ohb_scope}); fallback beta={ohb_fallback}")
         else:
             print(f"[GR00T-ATM] OHB enabled for {ohb_layers} layers using {alpha_path}")
+            if group_edges is not None:
+                print(f"[GR00T-ATM] Grouped OHB detected: group_edges={group_edges}")

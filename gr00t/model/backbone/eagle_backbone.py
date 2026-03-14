@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import types
 
 import torch
 from torch import nn
@@ -49,6 +50,7 @@ class EagleBackbone(nn.Module):
 
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        self._patch_eagle_dtype_alignment()
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
@@ -61,6 +63,27 @@ class EagleBackbone(nn.Module):
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual)
+
+    def _patch_eagle_dtype_alignment(self) -> None:
+        if not hasattr(self.eagle_model, "extract_feature"):
+            return
+        if getattr(self.eagle_model, "_gr00t_dtype_alignment_patched", False):
+            return
+
+        original_extract_feature = self.eagle_model.extract_feature
+
+        def extract_feature_with_dtype_alignment(module, pixel_values):
+            features = original_extract_feature(pixel_values)
+            target_dtype = module.language_model.get_input_embeddings().weight.dtype
+            if torch.is_floating_point(features) and features.dtype != target_dtype:
+                features = features.to(dtype=target_dtype)
+            return features
+
+        self.eagle_model.extract_feature = types.MethodType(
+            extract_feature_with_dtype_alignment,
+            self.eagle_model,
+        )
+        self.eagle_model._gr00t_dtype_alignment_patched = True
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
         self.tune_llm = tune_llm

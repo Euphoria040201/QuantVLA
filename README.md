@@ -41,6 +41,12 @@ Vision-language-action (VLA) models unify perception, language, and control for 
   💻 <a href="https://github.com/AIoT-MLSys-Lab/QuantVLA">Code</a>
 </p>
 
+## Local Experiment Guide
+
+For the local GR00T + LIBERO experiment workflow added in this branch, see:
+
+- [README_LIBERO_EXPERIMENTS.md](/work/mingze/QuantVLA/README_LIBERO_EXPERIMENTS.md)
+
 
 # QuantVLA GR00T Environment Setup Guide
 
@@ -289,5 +295,4 @@ If you find this code useful, please cite:
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2602.20309}, 
 }
-
 

@@ -3,6 +3,12 @@
 # Usage: ./run_libero_eval.sh [task_suite_name] [extra args...]
 # task_suite_name: libero_spatial (default), libero_goal, libero_object, libero_90, libero_10
 
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/scripts/common_paths.sh"
+
 TASK=${1:-libero_10}
 shift || true
 EXTRA_ARGS=("$@")
@@ -16,16 +22,21 @@ for arg in "${EXTRA_ARGS[@]}"; do
 done
 
 # Activate libero_test environment
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate libero_test
+quantvla_activate_env libero_test
 
 # Add QuantVLA_GR00T and LIBERO to Python path
-export PYTHONPATH=/home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T:/home/jz97/VLM_REPO/Isaac-GR00T/LIBERO:$PYTHONPATH
+quantvla_export_pythonpath
+quantvla_setup_cache_dirs
+quantvla_setup_libero_config
 
 echo "=========================================="
 echo "Running Libero evaluation for $TASK"
 echo "Headless mode: $HEADLESS_FLAG"
 echo "Port: 5556 (GR00T)"
+echo "QuantVLA root: $QUANTVLA_ROOT"
+echo "LIBERO root: $LIBERO_ROOT"
+echo "HF cache: $HF_HOME"
+echo "LIBERO config: $LIBERO_CONFIG_PATH"
 echo "=========================================="
 echo ""
 echo "Make sure the inference server is running in another terminal!"
@@ -37,6 +48,6 @@ echo "  - Videos: /tmp/logs/rollout_*.mp4"
 echo "=========================================="
 echo ""
 
-cd /home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T/examples/Libero/eval
+cd "${QUANTVLA_ROOT}/examples/Libero/eval"
 
 python run_libero_eval.py --task_suite_name "$TASK" --port 5556 "${EXTRA_ARGS[@]}"

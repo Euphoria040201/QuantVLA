@@ -3,11 +3,19 @@
 # Usage: ./run_inference_server.sh [task_suite_name]
 # task_suite_name: libero_spatial (default), libero_goal, libero_object, libero_90, libero_10
 
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/scripts/common_paths.sh"
+
 TASK=${1:-libero_10}
 
 # Activate groot_test environment
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate groot_test
+quantvla_activate_env groot_test
+quantvla_export_pythonpath
+quantvla_setup_cache_dirs
+quantvla_setup_libero_config
 
 # Set model path and data config based on task
 case $TASK in
@@ -49,12 +57,12 @@ echo "Port: 5556"
 echo "Denoising Steps: $DENOISING_STEPS"
 echo "=========================================="
 
-cd /home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T
+cd "${QUANTVLA_ROOT}"
 
 python scripts/inference_service.py \
-    --model_path $MODEL_PATH \
+    --model_path "$MODEL_PATH" \
     --server \
-    --data_config $DATA_CONFIG \
-    --denoising-steps 8 \
+    --data_config "$DATA_CONFIG" \
+    --denoising-steps "$DENOISING_STEPS" \
     --port 5556 \
     --embodiment-tag new_embodiment

@@ -1,5 +1,6 @@
 import os
 import pprint
+import json
 from dataclasses import dataclass
 
 import cv2
@@ -18,8 +19,8 @@ from examples.Libero.eval.utils import (
     save_rollout_video,
 )
 
-log_dir = "/tmp/logs"
-os.makedirs(log_dir, exist_ok=True)  # ensures directory exists
+DEFAULT_LOG_DIR = "/tmp/logs"
+os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)  # ensures directory exists
 
 
 def summarize_obs(obs_dict):
@@ -68,6 +69,16 @@ class GenerateConfig:
     task_ids: list[int] | None = None
     """Run tasks in this explicit order."""
     task_order: list[int] | None = None
+    """Directory for text logs."""
+    log_dir: str = DEFAULT_LOG_DIR
+    """Optional suffix appended to log / rollout names to keep shards separate."""
+    log_suffix: str = ""
+    """Optional directory to save rollout mp4s."""
+    rollout_dir: str | None = None
+    """Optional path to dump a machine-readable summary JSON."""
+    summary_json: str | None = None
+    """Whether to save rollout mp4 videos."""
+    save_videos: bool = True
 
 
 class GR00TPolicy:
@@ -145,13 +156,23 @@ class GR00TPolicy:
 
 
 def eval_libero(cfg: GenerateConfig) -> None:
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    log_stem = f"libero_eval_{cfg.task_suite_name}"
+    if cfg.log_suffix:
+        log_stem = f"{log_stem}_{cfg.log_suffix}"
+    log_path = os.path.join(cfg.log_dir, f"{log_stem}.log")
+
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
     print(f"Task suite: {cfg.task_suite_name}")
-    log_file = open(f"{log_dir}/libero_eval_{cfg.task_suite_name}.log", "w")
+    print(f"Task IDs: {cfg.task_ids if cfg.task_ids is not None else 'all'}")
+    print(f"Log path: {log_path}")
+    log_file = open(log_path, "w")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
+    log_file.write(f"Task IDs: {cfg.task_ids if cfg.task_ids is not None else 'all'}\n")
+    log_file.write(f"Log path: {log_path}\n")
 
     # Decide which task indices to run
     if cfg.task_ids:
@@ -166,6 +187,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    task_summaries = []
     for task_id in tqdm.tqdm(task_indices):
         # Get task
         task = task_suite.get_task(task_id)
@@ -247,14 +269,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
             total_episodes += 1
 
             # Save a replay video of the episode
-            save_rollout_video(
-                top_view,
-                wrist_view,
-                total_episodes,
-                success=done,
-                task_description=task_description,
-                log_file=log_file,
-            )
+            if cfg.save_videos:
+                save_rollout_video(
+                    top_view,
+                    wrist_view,
+                    total_episodes,
+                    success=done,
+                    task_description=task_description,
+                    log_file=log_file,
+                    rollout_dir=cfg.rollout_dir,
+                )
 
             # Log current results
             print(f"Success: {done}")
@@ -268,18 +292,52 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.flush()
 
         # Log final results
-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        task_success_rate = float(task_successes) / float(task_episodes)
+        total_success_rate = float(total_successes) / float(total_episodes)
+        print(f"Current task success rate: {task_success_rate}")
+        print(f"Current total success rate: {total_success_rate}")
         log_file.write(
-            f"Current task success rate: {float(task_successes) / float(task_episodes)}\n"
+            f"Current task success rate: {task_success_rate}\n"
         )
         log_file.write(
-            f"Current total success rate: {float(total_successes) / float(total_episodes)}\n"
+            f"Current total success rate: {total_success_rate}\n"
         )
         log_file.flush()
+        task_summaries.append(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "episodes": task_episodes,
+                "successes": task_successes,
+                "success_rate": task_success_rate,
+            }
+        )
 
     # Save local log file
     log_file.close()
+
+    summary = {
+        "task_suite_name": cfg.task_suite_name,
+        "task_ids": task_indices,
+        "num_trials_per_task": cfg.num_trials_per_task,
+        "num_steps_wait": cfg.num_steps_wait,
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "total_success_rate": float(total_successes) / float(total_episodes)
+        if total_episodes
+        else 0.0,
+        "task_summaries": task_summaries,
+        "log_path": log_path,
+        "rollout_dir": cfg.rollout_dir,
+    }
+
+    if cfg.summary_json:
+        summary_dir = os.path.dirname(cfg.summary_json)
+        if summary_dir:
+            os.makedirs(summary_dir, exist_ok=True)
+        with open(cfg.summary_json, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Summary JSON written to {cfg.summary_json}")
 
 
 if __name__ == "__main__":

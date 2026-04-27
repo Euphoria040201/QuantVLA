@@ -22,7 +22,15 @@
 
 set -e
 
-cd /home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/scripts/common_paths.sh"
+
+cd "${QUANTVLA_ROOT}"
+quantvla_activate_env groot_test
+quantvla_export_pythonpath
+quantvla_setup_cache_dirs
+quantvla_setup_libero_config
 
 # Task configuration
 TASK_SUITE="${1:-libero_10}"
@@ -98,7 +106,7 @@ export GR00T_DUQUANT_CALIB_STEPS=32      # Conservative calibration
 export GR00T_DUQUANT_LS=0.15              # Increased smoothing for stability
 
 # Pack directory for caching quantization metadata
-export GR00T_DUQUANT_PACKDIR="/home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T/duquant_packed_full_llm_dit_mlp_w4a8_b64c32ls015_long_0"
+export GR00T_DUQUANT_PACKDIR="${QUANTVLA_ROOT}/duquant_packed_full_llm_dit_mlp_w4a8_b64c32ls015_long_0"
 
 
 # ATM configuration (optional)
@@ -109,7 +117,7 @@ export GR00T_DUQUANT_PACKDIR="/home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T/duqu
 # export GR00T_ATM_SCOPE=${GR00T_ATM_SCOPE:-dit}
 
 
-export GR00T_ATM_ALPHA_PATH=/home/jz97/VLM_REPO/groot_test/QuantVLA_GR00T/atm_alpha_beta_long.json
+export GR00T_ATM_ALPHA_PATH="${QUANTVLA_ROOT}/atm_alpha_beta_long.json"
 export GR00T_ATM_ENABLE=1
 export GR00T_ATM_SCOPE=${GR00T_ATM_SCOPE:-dit}
 

@@ -81,9 +81,9 @@ from gr00t.quantization.duquant_layers import select_targets  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--checkpoint", default="")
     p.add_argument("--data-source", default="libero", choices=["libero"])
-    p.add_argument("--dataset-path", default="/data/ziyu/LIBERO/datasets/lerobot_libero_10")
+    p.add_argument("--dataset-path", default="/work/mingze/LIBERO/datasets/lerobot_libero_10")
     p.add_argument("--task-suite-name", default="libero_10")
     p.add_argument("--data-config", default="examples.Libero.custom_data_config:LiberoDataConfig")
     p.add_argument("--embodiment-tag", default="new_embodiment")
@@ -115,9 +115,17 @@ def parse_args() -> argparse.Namespace:
                    help="Random extra layers for spectrum baseline.")
 
     p.add_argument("--scan-dir",
-                   default="/data/ziyu/QuantVLA/results/layerwise_quant_2gpu_taskwise_s10_w3a8_gpu67",
+                   default="/work/mingze/QuantVLA/results/layerwise_quant_2gpu_taskwise_s10_w3a8_gpu67",
                    help="Existing layerwise scan directory (for RMSE join).")
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--plot-only", action="store_true",
+                   help="Only regenerate plots from output-dir/aspq_per_layer.csv.")
+    p.add_argument("--metric-output", default="",
+                   help="Optional .pt path to save ASPQ eigenspaces for DuQuant.")
+    p.add_argument("--metric-top-k", type=int, default=64,
+                   help="Top eigenvectors per layer to save in --metric-output.")
+    p.add_argument("--metric-all-layers", action="store_true",
+                   help="Store full M_l for every selected layer so --metric-output covers all quantized layers.")
     return p.parse_args()
 
 
@@ -147,6 +155,38 @@ def family_of(name: str) -> str:
     if "transformer_blocks" in name:
         return "dit"
     return "other"
+
+
+def op_class_of(name: str) -> str:
+    if "language_model" in name:
+        for op in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
+            if name.endswith(f".{op}"):
+                return f"llm.{op}"
+        return "llm.other"
+    if "transformer_blocks" in name:
+        for op in ("attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0", "ff.net.0.proj", "ff.net.2"):
+            if op in name:
+                return f"dit.{op}"
+        return "dit.other"
+    return "other"
+
+
+def short_layer_name(name: str) -> str:
+    return (
+        name.replace("backbone.eagle_model.language_model.model.layers.", "llm.L")
+        .replace("backbone.eagle_model.language_model.layers.", "llm.L")
+        .replace("action_head.model.transformer_blocks.", "dit.B")
+    )
+
+
+def spearman(xs: Sequence[float], ys: Sequence[float]) -> float:
+    if len(xs) < 2:
+        return float("nan")
+    sx = np.asarray(xs)
+    sy = np.asarray(ys)
+    rx = np.argsort(np.argsort(sx))
+    ry = np.argsort(np.argsort(sy))
+    return float(np.corrcoef(rx, ry)[0, 1])
 
 
 @dataclass
@@ -321,7 +361,7 @@ def plot_score_vs_rmse(rows, out_path: Path):
     import matplotlib.pyplot as plt
     xs, ys, fams = [], [], []
     for r in rows:
-        if r["action_fp_rmse_individual"] is None:
+        if r["action_fp_rmse_individual"] is None or r["score"] <= 0 or r["action_fp_rmse_individual"] <= 0:
             continue
         xs.append(r["score"]); ys.append(r["action_fp_rmse_individual"])
         fams.append(r["family"])
@@ -330,7 +370,14 @@ def plot_score_vs_rmse(rows, out_path: Path):
         sx = [x for x, fm in zip(xs, fams) if fm == f]
         sy = [y for y, fm in zip(ys, fams) if fm == f]
         ax.scatter(sx, sy, s=14, color=c, alpha=0.7, label=f)
-    ax.set_xscale("log"); ax.set_yscale("log")
+    if xs and ys:
+        ax.set_xscale("log"); ax.set_yscale("log")
+    else:
+        ax.text(
+            0.5, 0.5,
+            "No positive RMSE join found.\nPass --scan-dir with scenario_summary.csv.",
+            ha="center", va="center", transform=ax.transAxes,
+        )
     ax.set_xlabel("ASPQ score: tr(M) * tr(H) / d_out")
     ax.set_ylabel("Observed individual W3A8 action_fp_rmse")
     ax.set_title("ASPQ score vs measured per-layer RMSE")
@@ -384,6 +431,173 @@ def plot_eff_rank(spectrum: dict, out_path: Path):
     plt.close(fig)
 
 
+def plot_takeaway(rows, spectrum: dict, out_path: Path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    paired = [
+        r for r in rows
+        if r["action_fp_rmse_individual"] is not None
+        and r["score"] > 0
+        and r["action_fp_rmse_individual"] > 0
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+
+    # Panel 1: global diagnostic scatter.
+    ax = axes[0]
+    for f, c in [("llm", "#d95f0e"), ("dit", "#2c7fb8")]:
+        rs = [r for r in paired if r["family"] == f]
+        ax.scatter(
+            [r["score"] for r in rs],
+            [r["action_fp_rmse_individual"] for r in rs],
+            s=18,
+            color=c,
+            alpha=0.72,
+            label=f"{f} (n={len(rs)})",
+        )
+    if paired:
+        rho = spearman([r["score"] for r in paired], [r["action_fp_rmse_individual"] for r in paired])
+        top = sorted(paired, key=lambda r: -r["action_fp_rmse_individual"])[:3]
+        for r in top:
+            ax.annotate(
+                short_layer_name(r["layer_name"]),
+                (r["score"], r["action_fp_rmse_individual"]),
+                fontsize=7,
+                xytext=(4, 4),
+                textcoords="offset points",
+            )
+        ax.text(0.03, 0.97, f"Spearman rho = {rho:.3f}", transform=ax.transAxes, va="top", fontsize=10)
+    if paired:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    else:
+        ax.text(
+            0.5, 0.5,
+            "No RMSE join.\nASPQ scores were computed,\nbut correlation needs scan-dir.",
+            ha="center", va="center", transform=ax.transAxes,
+        )
+    ax.set_xlabel("ASPQ score")
+    ax.set_ylabel("Measured W3A8 action RMSE")
+    ax.set_title("Score predicts sensitive layers")
+    ax.grid(True, which="both", alpha=0.25)
+    ax.legend(fontsize=8, loc="lower right")
+
+    # Panel 2: sorted effective-rank ratios for layers where full M was stored.
+    ax = axes[1]
+    spec_items = sorted(
+        [(name, val) for name, val in spectrum.items() if val.get("eff_rank_ratio") is not None],
+        key=lambda kv: kv[1]["eff_rank_ratio"],
+    )
+    if spec_items:
+        vals = [100.0 * val["eff_rank_ratio"] for _, val in spec_items]
+        cols = ["#d95f0e" if family_of(name) == "llm" else "#2c7fb8" for name, _ in spec_items]
+        x = np.arange(len(vals))
+        ax.bar(x, vals, color=cols, alpha=0.85)
+        med = float(np.median(vals))
+        ax.axhline(med, color="black", linewidth=1.0, linestyle="--")
+        ax.text(0.02, 0.94, f"median = {med:.2f}%", transform=ax.transAxes, va="top", fontsize=10)
+        ax.set_xlim(-0.7, len(vals) - 0.3)
+    else:
+        ax.text(
+            0.5, 0.5,
+            "No full M stored.\nRe-run with spectrum layers selected.",
+            ha="center", va="center", transform=ax.transAxes,
+        )
+    ax.set_xlabel("Full-M layers, sorted")
+    ax.set_ylabel("eff_rank(M) / d_out (%)")
+    ax.set_title("Action subspace is tiny")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    # Panel 3: within-op rank correlation; this removes gross op-family scale effects.
+    ax = axes[2]
+    op_rows = {}
+    for r in paired:
+        op_rows.setdefault(op_class_of(r["layer_name"]), []).append(r)
+    op_stats = []
+    for op, rs in op_rows.items():
+        if len(rs) < 3:
+            continue
+        rho = spearman([r["score"] for r in rs], [r["action_fp_rmse_individual"] for r in rs])
+        if np.isfinite(rho):
+            op_stats.append((op, rho, len(rs)))
+    op_stats = sorted(op_stats, key=lambda item: item[1])
+    if op_stats:
+        y = np.arange(len(op_stats))
+        vals = [rho for _, rho, _ in op_stats]
+        labels = [f"{op} ({n})" for op, _, n in op_stats]
+        cols = ["#d95f0e" if op.startswith("llm.") else "#2c7fb8" for op, _, _ in op_stats]
+        ax.barh(y, vals, color=cols, alpha=0.85)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlim(-1.0, 1.0)
+    else:
+        ax.text(
+            0.5, 0.5,
+            "No within-op correlation\nwithout RMSE join.",
+            ha="center", va="center", transform=ax.transAxes,
+        )
+    ax.set_xlabel("Spearman rho within op class")
+    ax.set_title("Correlation is stronger within type")
+    ax.grid(True, axis="x", alpha=0.25)
+
+    fig.suptitle("ASPQ sanity check: action sensitivity is predictable and low-rank", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _maybe_float(v):
+    if v is None or v == "":
+        return None
+    return float(v)
+
+
+def _maybe_int(v):
+    if v is None or v == "":
+        return None
+    return int(float(v))
+
+
+def load_existing_rows(csv_path: Path) -> list[dict]:
+    rows = []
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append({
+                "layer_name": row["layer_name"],
+                "family": row.get("family") or family_of(row["layer_name"]),
+                "d_in": _maybe_int(row.get("d_in")),
+                "d_out": _maybe_int(row.get("d_out")),
+                "n_calib_tokens": _maybe_int(row.get("n_calib_tokens")),
+                "tr_M": _maybe_float(row.get("tr_M")),
+                "tr_H": _maybe_float(row.get("tr_H")),
+                "score": _maybe_float(row.get("score")) or 0.0,
+                "eff_rank": _maybe_float(row.get("eff_rank")),
+                "eff_rank_ratio": _maybe_float(row.get("eff_rank_ratio")),
+                "action_fp_rmse_individual": _maybe_float(row.get("action_fp_rmse_individual")),
+            })
+    return rows
+
+
+def regenerate_plots(out: Path):
+    rows = load_existing_rows(out / "aspq_per_layer.csv")
+    spectrum_path = out / "aspq_subset_spectrum.json"
+    spectrum = {}
+    if spectrum_path.exists():
+        with open(spectrum_path) as f:
+            spectrum = json.load(f)
+
+    plots_dir = out / "plots"
+    plots_dir.mkdir(exist_ok=True)
+    plot_score_vs_rmse(rows, plots_dir / "score_vs_rmse.png")
+    plot_top20_score(rows, plots_dir / "top20_score.png")
+    if spectrum:
+        plot_eff_rank(spectrum, plots_dir / "effective_rank.png")
+    plot_takeaway(rows, spectrum, plots_dir / "aspq_takeaway.png")
+    print(f"[ASPQ] regenerated plots in {plots_dir}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -392,6 +606,11 @@ def main():
     args = parse_args()
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     (out / "plots").mkdir(exist_ok=True)
+    if args.plot_only:
+        regenerate_plots(out)
+        return
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --plot-only is set")
     rng = np.random.default_rng(args.seed)
 
     print(f"[ASPQ] loading FP policy ... {args.checkpoint}")
@@ -411,13 +630,27 @@ def main():
 
     # Pick which layers get full M_l
     full_M_layers: set[str] = set()
-    if rmse_lookup:
+    if args.metric_all_layers:
+        full_M_layers = set(layer_names)
+        print(
+            "[ASPQ] metric-all-layers enabled; storing full M for every selected layer. "
+            "This can use substantial CPU RAM."
+        )
+    elif rmse_lookup:
         ranked = sorted(rmse_lookup.items(), key=lambda kv: -kv[1])
         top = [n for n, _ in ranked[: args.full_spectrum_top_k]]
         rest = [n for n in layer_names if n not in set(top)]
         extras = list(rng.choice(rest, size=min(args.full_spectrum_extra, len(rest)),
                                  replace=False)) if rest else []
         full_M_layers = set(top) | set(extras)
+    else:
+        n_full = min(args.full_spectrum_top_k + args.full_spectrum_extra, len(layer_names))
+        if n_full > 0:
+            full_M_layers = set(rng.choice(layer_names, size=n_full, replace=False).tolist())
+        print(
+            "[ASPQ] no RMSE scan joined; storing full M for a random subset "
+            f"of {len(full_M_layers)} layers"
+        )
     print(f"[ASPQ] storing full M for {len(full_M_layers)} layers")
 
     # Load samples
@@ -453,6 +686,7 @@ def main():
     # ----- summarize ---------------------------------------------------------
     rows = []
     spectrum: dict[str, dict] = {}
+    metric_records: dict[str, dict] = {}
     for n in layer_names:
         ac = accums[n]
         if ac.n_tokens == 0:
@@ -464,14 +698,36 @@ def main():
         if ac.full_M is not None:
             M = ac.full_M / max(ac.n_tokens, 1)
             try:
-                eigs = torch.linalg.eigvalsh(M).numpy()
+                eigvals_t, U_t = torch.linalg.eigh(M)
+                eigs = eigvals_t.numpy()
             except Exception:
-                eigs = np.linalg.eigvalsh(M.numpy())
+                eigs_np, U_np = np.linalg.eigh(M.numpy())
+                eigvals_t = torch.from_numpy(eigs_np)
+                U_t = torch.from_numpy(U_np)
+                eigs = eigs_np
             eigs = np.clip(eigs, 0.0, None)
             tr1 = float(eigs.sum())
             tr2 = float((eigs ** 2).sum())
             eff_rank = (tr1 ** 2) / max(tr2, 1e-30)
             eff_rank_ratio = eff_rank / ac.d_out
+            order_t = torch.argsort(eigvals_t, descending=True)
+            eigvals_sorted = torch.clamp(eigvals_t[order_t], min=0.0)
+            U_sorted = U_t[:, order_t]
+            if args.metric_output:
+                keep = torch.isfinite(eigvals_sorted) & (eigvals_sorted > 0)
+                if args.metric_top_k > 0:
+                    top = min(int(args.metric_top_k), int(keep.sum().item()))
+                    selected = torch.nonzero(keep, as_tuple=False).flatten()[:top]
+                else:
+                    selected = torch.nonzero(keep, as_tuple=False).flatten()
+                metric_records[n] = {
+                    "U": U_sorted[:, selected].to(torch.float32).contiguous().cpu(),
+                    "eigvals": eigvals_sorted[selected].to(torch.float32).contiguous().cpu(),
+                    "d_out": ac.d_out,
+                    "n_calib_tokens": ac.n_tokens,
+                    "eff_rank": eff_rank,
+                    "eff_rank_ratio": eff_rank_ratio,
+                }
             spectrum[n] = {
                 "d_out": ac.d_out,
                 "eff_rank": eff_rank,
@@ -505,6 +761,12 @@ def main():
     with open(out / "aspq_subset_spectrum.json", "w") as f:
         json.dump(spectrum, f, indent=2)
 
+    if args.metric_output:
+        metric_path = Path(args.metric_output)
+        metric_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(metric_records, metric_path)
+        print(f"[ASPQ] wrote DuQuant metric eigenspaces for {len(metric_records)} layers to {metric_path}")
+
     # Spearman correlation
     pairs = [(r["score"], r["action_fp_rmse_individual"])
              for r in rows if r["action_fp_rmse_individual"] is not None]
@@ -520,6 +782,7 @@ def main():
     plot_top20_score(rows, out / "plots" / "top20_score.png")
     if spectrum:
         plot_eff_rank(spectrum, out / "plots" / "effective_rank.png")
+    plot_takeaway(rows, spectrum, out / "plots" / "aspq_takeaway.png")
     restore_no_grad_methods(patched)
     print(f"[ASPQ] done. results in {out}")
 

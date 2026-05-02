@@ -1,4 +1,4 @@
-#!/work/mingze/miniconda3/envs/groot_test/bin/python
+#!/usr/bin/env python
 
 import json
 import math
@@ -11,8 +11,11 @@ import time
 from pathlib import Path
 
 
-GROOT_PY = "/work/mingze/miniconda3/envs/groot_test/bin/python"
-LIBERO_PY = "/work/mingze/miniconda3/envs/libero_test/bin/python"
+CONDA_ROOT = Path(os.environ.get("CONDA_ROOT", "/work/mingze/miniconda3")).resolve()
+GROOT_CONDA_ENV = os.environ.get("GROOT_CONDA_ENV", os.environ.get("QUANTVLA_CONDA_ENV", "groot_test"))
+LIBERO_CONDA_ENV = os.environ.get("LIBERO_CONDA_ENV", "libero_test")
+GROOT_PY = os.environ.get("GROOT_PY", str(CONDA_ROOT / "envs" / GROOT_CONDA_ENV / "bin" / "python"))
+LIBERO_PY = os.environ.get("LIBERO_PY", str(CONDA_ROOT / "envs" / LIBERO_CONDA_ENV / "bin" / "python"))
 QUANTVLA_ROOT = Path(os.environ.get("QUANTVLA_ROOT", "/work/mingze/QuantVLA")).resolve()
 LIBERO_ROOT = Path(os.environ.get("LIBERO_ROOT", "/work/mingze/LIBERO")).resolve()
 
@@ -115,21 +118,25 @@ def make_base_env() -> dict[str, str]:
 
 
 def configure_duquant_env(env: dict[str, str], wbits: int, abits: int, packdir: str) -> None:
-    env["GR00T_DUQUANT_DEBUG"] = "1"
-    env["GR00T_DUQUANT_SCOPE"] = ""
-    env["GR00T_DUQUANT_INCLUDE"] = (
+    env["GR00T_DUQUANT_DEBUG"] = env.get("GR00T_DUQUANT_DEBUG", "1")
+    env["GR00T_DUQUANT_SCOPE"] = env.get("GR00T_DUQUANT_SCOPE", "")
+    env["GR00T_DUQUANT_INCLUDE"] = env.get("GR00T_DUQUANT_INCLUDE", (
         r".*(backbone\.eagle_model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
         r"|action_head\.model\.transformer_blocks\.\d+\.ff\.net\.(0\.proj|2)).*"
+    ))
+    env["GR00T_DUQUANT_EXCLUDE"] = env.get(
+        "GR00T_DUQUANT_EXCLUDE",
+        r"(?:^|\.)(vision|radio|norm|ln|layernorm|embed|lm_head|attn1)(?:\.|$)",
     )
-    env["GR00T_DUQUANT_EXCLUDE"] = r"(?:^|\.)(vision|radio|norm|ln|layernorm|embed|lm_head|attn1)(?:\.|$)"
     env["GR00T_DUQUANT_WBITS_DEFAULT"] = str(wbits)
     env["GR00T_DUQUANT_ABITS"] = str(abits)
-    env["GR00T_DUQUANT_BLOCK"] = "64"
-    env["GR00T_DUQUANT_PERMUTE"] = "0"
-    env["GR00T_DUQUANT_ROW_ROT"] = "restore"
-    env["GR00T_DUQUANT_ACT_PCT"] = "99.9"
-    env["GR00T_DUQUANT_CALIB_STEPS"] = "32"
-    env["GR00T_DUQUANT_LS"] = "0.15"
+    env["GR00T_DUQUANT_BLOCK"] = env.get("GR00T_DUQUANT_BLOCK", "64")
+    env["GR00T_DUQUANT_BLOCK_OUT"] = env.get("GR00T_DUQUANT_BLOCK_OUT", env["GR00T_DUQUANT_BLOCK"])
+    env["GR00T_DUQUANT_PERMUTE"] = env.get("GR00T_DUQUANT_PERMUTE", "0")
+    env["GR00T_DUQUANT_ROW_ROT"] = env.get("GR00T_DUQUANT_ROW_ROT", "restore")
+    env["GR00T_DUQUANT_ACT_PCT"] = env.get("GR00T_DUQUANT_ACT_PCT", "99.9")
+    env["GR00T_DUQUANT_CALIB_STEPS"] = env.get("GR00T_DUQUANT_CALIB_STEPS", "32")
+    env["GR00T_DUQUANT_LS"] = env.get("GR00T_DUQUANT_LS", "0.15")
     env["GR00T_DUQUANT_PACKDIR"] = packdir
     env["GR00T_ATM_ENABLE"] = "0"
     env["GR00T_OHB_ENABLE"] = "0"

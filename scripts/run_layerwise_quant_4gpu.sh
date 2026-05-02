@@ -6,12 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/common_paths.sh"
 
-quantvla_activate_env quantvla
+QUANTVLA_CONDA_ENV="${QUANTVLA_CONDA_ENV:-groot_test}"
+quantvla_activate_env "${QUANTVLA_CONDA_ENV}"
 quantvla_export_pythonpath
 quantvla_setup_cache_dirs
 quantvla_setup_libero_config
 CONDA_ROOT="$(quantvla_find_conda_root)"
-PYTHON_BIN="${CONDA_ROOT}/envs/quantvla/bin/python"
+PYTHON_BIN="${CONDA_ROOT}/envs/${QUANTVLA_CONDA_ENV}/bin/python"
 
 if [ ! -x "${PYTHON_BIN}" ]; then
     echo "Expected python not found at ${PYTHON_BIN}"

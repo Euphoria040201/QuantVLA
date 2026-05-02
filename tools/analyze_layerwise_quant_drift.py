@@ -32,15 +32,15 @@ import torch
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_ROOT = Path("/data/ziyu/.cache/quantvla")
+DEFAULT_CACHE_ROOT = Path(os.environ.get("QUANTVLA_CACHE_ROOT", "/work/mingze/.cache/quantvla"))
 DEFAULT_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(DEFAULT_CACHE_ROOT / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(DEFAULT_CACHE_ROOT / "huggingface" / "hub"))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(DEFAULT_CACHE_ROOT / "huggingface" / "transformers"))
 os.environ.setdefault("HF_MODULES_CACHE", str(DEFAULT_CACHE_ROOT / "huggingface" / "modules"))
 os.environ.setdefault("TORCH_HOME", str(DEFAULT_CACHE_ROOT / "torch"))
-os.environ.setdefault("LIBERO_CONFIG_PATH", "/data/ziyu/.libero")
-os.environ.setdefault("LIBERO_ROOT", "/data/ziyu/LIBERO")
+os.environ.setdefault("LIBERO_CONFIG_PATH", "/work/mingze/.libero")
+os.environ.setdefault("LIBERO_ROOT", "/work/mingze/LIBERO")
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -345,9 +345,13 @@ def ensure_libero_runtime() -> None:
     extra = os.environ.get("QUANTVLA_EXTRA_SITE_DIRS", "")
     if extra:
         candidates.extend([path for path in extra.split(":") if path])
+    conda_root = os.environ.get("CONDA_ROOT", "/work/mingze/miniconda3")
+    quant_env = os.environ.get("QUANTVLA_CONDA_ENV", "groot_test")
+    libero_env = os.environ.get("LIBERO_CONDA_ENV", "libero_test")
     candidates.extend(
         [
-            "/data/ziyu/miniconda3/envs/quantvla/lib/python3.10/site-packages",
+            f"{conda_root}/envs/{quant_env}/lib/python3.10/site-packages",
+            f"{conda_root}/envs/{libero_env}/lib/python3.10/site-packages",
         ]
     )
     for path in candidates:
@@ -570,6 +574,16 @@ def build_duquant_env(args: argparse.Namespace, layer_names: Sequence[str]) -> d
     }
     if args.packdir:
         env["GR00T_DUQUANT_PACKDIR"] = args.packdir
+    for key in (
+        "GR00T_DUQUANT_ASPQ",
+        "GR00T_DUQUANT_ASPQ_PATH",
+        "GR00T_DUQUANT_ASPQ_DIR",
+        "GR00T_DUQUANT_ASPQ_TOPK",
+        "GR00T_DUQUANT_ASPQ_MIN_EIG",
+        "GR00T_DUQUANT_ASPQ_MISSING",
+    ):
+        if key in os.environ:
+            env[key] = os.environ[key]
     return env
 
 

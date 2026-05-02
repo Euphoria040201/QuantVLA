@@ -14,7 +14,7 @@ quantvla_find_conda_root() {
     if [[ -n "${CONDA_EXE:-}" ]]; then
         candidates+=("$(cd "$(dirname "${CONDA_EXE}")/.." && pwd)")
     fi
-    candidates+=("${HOME}/miniconda3" "/work/mingze/miniconda3")
+    candidates+=("/work/mingze/miniconda3" "${HOME}/miniconda3")
 
     local candidate
     for candidate in "${candidates[@]}"; do
@@ -79,7 +79,7 @@ quantvla_export_pythonpath() {
 }
 
 quantvla_setup_cache_dirs() {
-    local cache_root="${QUANTVLA_CACHE_ROOT:-/data/ziyu/.cache/quantvla}"
+    local cache_root="${QUANTVLA_CACHE_ROOT:-/work/mingze/.cache/quantvla}"
     mkdir -p "${cache_root}/huggingface" "${cache_root}/torch" "${cache_root}/xdg"
 
     export QUANTVLA_CACHE_ROOT="${cache_root}"

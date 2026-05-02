@@ -42,14 +42,19 @@ from transformers.utils import ModelOutput
 ####
 
 
+FLASH_ATTN_AVAILABLE = True
 try:  # v1
     from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-except ImportError:  # v2
-    from flash_attn.flash_attn_interface import (
-        flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
-    )
-
-from flash_attn.bert_padding import pad_input, unpad_input
+    from flash_attn.bert_padding import pad_input, unpad_input
+except ImportError:
+    try:  # v2
+        from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func
+        from flash_attn.bert_padding import pad_input, unpad_input
+    except ImportError:
+        FLASH_ATTN_AVAILABLE = False
+        flash_attn_unpadded_qkvpacked_func = None
+        pad_input = None
+        unpad_input = None
 
 
 class FlashAttention(nn.Module):
@@ -180,7 +185,8 @@ def replace_vit_attn_with_flash_attn():
     Attention._flash_attn = _flash_attn
 
 
-replace_vit_attn_with_flash_attn()
+if FLASH_ATTN_AVAILABLE:
+    replace_vit_attn_with_flash_attn()
 ####
 
 

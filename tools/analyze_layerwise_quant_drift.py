@@ -32,15 +32,15 @@ import torch
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_ROOT = Path("/work/mingze/.cache/quantvla")
+DEFAULT_CACHE_ROOT = Path("/data/ziyu/.cache/quantvla")
 DEFAULT_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(DEFAULT_CACHE_ROOT / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(DEFAULT_CACHE_ROOT / "huggingface" / "hub"))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(DEFAULT_CACHE_ROOT / "huggingface" / "transformers"))
 os.environ.setdefault("HF_MODULES_CACHE", str(DEFAULT_CACHE_ROOT / "huggingface" / "modules"))
 os.environ.setdefault("TORCH_HOME", str(DEFAULT_CACHE_ROOT / "torch"))
-os.environ.setdefault("LIBERO_CONFIG_PATH", "/work/mingze/.libero")
-os.environ.setdefault("LIBERO_ROOT", "/work/mingze/LIBERO")
+os.environ.setdefault("LIBERO_CONFIG_PATH", "/data/ziyu/.libero")
+os.environ.setdefault("LIBERO_ROOT", "/data/ziyu/LIBERO")
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -118,6 +118,20 @@ class RunningDiffStats:
         }
 
 
+def sample_task_id(sample: dict[str, Any]) -> int | None:
+    value = sample.get("task_id")
+    if value is None:
+        return None
+    return int(value)
+
+
+def sample_task_label(sample: dict[str, Any]) -> str:
+    task_id = sample_task_id(sample)
+    if task_id is None:
+        return "all_samples"
+    return f"task_{task_id:02d}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze layer-wise DuQuant drift on LIBERO data.")
     parser.add_argument("--checkpoint", required=True, help="Model checkpoint path or HF repo id.")
@@ -148,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Initial no-op steps in LIBERO to let objects settle.",
+    )
+    parser.add_argument(
+        "--libero-sampling-mode",
+        default="sequential",
+        choices=["sequential", "one_per_task"],
+        help="How LIBERO observations are gathered. one_per_task collects at most one sample per task.",
     )
     parser.add_argument(
         "--libero-resolution",
@@ -296,6 +316,11 @@ def parse_args() -> argparse.Namespace:
         default="results/layerwise_quant_analysis",
         help="Directory for metrics and metadata.",
     )
+    parser.add_argument(
+        "--split-by-task",
+        action="store_true",
+        help="Also write task-specific summary rows and per-layer metrics.",
+    )
     return parser.parse_args()
 
 
@@ -322,7 +347,7 @@ def ensure_libero_runtime() -> None:
         candidates.extend([path for path in extra.split(":") if path])
     candidates.extend(
         [
-            "/work/mingze/miniconda3/envs/libero_test/lib/python3.10/site-packages",
+            "/data/ziyu/miniconda3/envs/quantvla/lib/python3.10/site-packages",
         ]
     )
     for path in candidates:
@@ -399,6 +424,8 @@ def load_libero_samples(args: argparse.Namespace, data_config):
 
     task_suite = benchmark_dict[args.task_suite_name]()
     for task_id in range(task_suite.n_tasks):
+        if len(samples) >= args.num_samples:
+            break
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, _ = get_libero_env(task, resolution=args.libero_resolution)
@@ -413,6 +440,24 @@ def load_libero_samples(args: argparse.Namespace, data_config):
                         break
 
                 step_idx = 0
+                if args.libero_sampling_mode == "one_per_task":
+                    converted = _convert_libero_observation(obs, task.language)
+                    samples.append(
+                        {
+                            "dataset_index": int(len(samples)),
+                            "trajectory_id": int(task_id),
+                            "base_index": int(step_idx),
+                            "seed": int(args.seed + len(samples)),
+                            "obs": converted,
+                            "gt_action": None,
+                            "task_suite": args.task_suite_name,
+                            "task_id": int(task_id),
+                            "trial_idx": int(trial_idx),
+                            "language": task.language,
+                        }
+                    )
+                    break
+
                 while len(samples) < args.num_samples:
                     converted = _convert_libero_observation(obs, task.language)
                     samples.append(
@@ -805,8 +850,10 @@ def main() -> None:
         "libero_config": {
             "num_trials_per_task": args.libero_num_trials_per_task,
             "num_steps_wait": args.libero_num_steps_wait,
+            "sampling_mode": args.libero_sampling_mode,
             "resolution": args.libero_resolution,
         },
+        "split_by_task": args.split_by_task,
     }
     write_json(output_dir / "run_config.json", run_config)
     write_json(output_dir / "target_layers.json", target_layers)
@@ -860,8 +907,16 @@ def main() -> None:
     print(f"[Layerwise] Scenarios in this run: {len(scenarios)}")
 
     has_gt = all(sample.get("gt_action") is not None for sample in samples)
+    task_samples: dict[int, dict[str, Any]] = {}
+    if args.split_by_task:
+        for sample in samples:
+            task_id = sample_task_id(sample)
+            if task_id is not None and task_id not in task_samples:
+                task_samples[task_id] = sample
+
     fp_vs_gt = RunningDiffStats() if has_gt else None
     scenario_rows: list[dict[str, Any]] = []
+    task_scenario_rows: list[dict[str, Any]] = []
     if not args.skip_baseline:
         print("[Layerwise] Capturing full-precision baseline...")
         fp_policy = load_policy(args, data_config, quantized_layers=None)
@@ -890,10 +945,24 @@ def main() -> None:
                 **(fp_vs_gt.to_dict("fp_gt") if fp_vs_gt is not None else {}),
             }
         )
+        if args.split_by_task:
+            for task_id, sample in sorted(task_samples.items()):
+                row = {
+                    "scenario": "full_precision",
+                    "mode": "baseline",
+                    "num_quantized_layers": 0,
+                    "focus_layer": "",
+                    "task_id": task_id,
+                    "task_label": sample_task_label(sample),
+                    "task_suite": sample.get("task_suite", args.task_suite_name),
+                    "language": sample.get("language", ""),
+                }
+                task_scenario_rows.append(row)
     else:
         print("[Layerwise] Skipping baseline for this shard.")
 
     per_layer_rows: list[dict[str, Any]] = []
+    task_per_layer_rows: list[dict[str, Any]] = []
 
     for scenario in scenarios:
         print(
@@ -932,10 +1001,20 @@ def main() -> None:
 
         action_vs_fp = RunningDiffStats()
         quant_vs_gt = RunningDiffStats() if has_gt else None
+        task_action_vs_fp: dict[int, RunningDiffStats] = {}
+        task_quant_vs_gt: dict[int, RunningDiffStats] = {}
         for sample, fp_action, quant_action in zip(samples, fp_actions_ref, quant_actions):
             action_vs_fp.update(fp_action, quant_action)
             if quant_vs_gt is not None:
                 quant_vs_gt.update(sample["gt_action"], quant_action)
+            if args.split_by_task:
+                task_id = sample_task_id(sample)
+                if task_id is not None:
+                    task_action_vs_fp.setdefault(task_id, RunningDiffStats()).update(fp_action, quant_action)
+                    if quant_vs_gt is not None:
+                        task_quant_vs_gt.setdefault(task_id, RunningDiffStats()).update(
+                            sample["gt_action"], quant_action
+                        )
 
         if args.skip_baseline:
             fp_vs_gt = RunningDiffStats() if has_gt else None
@@ -946,11 +1025,21 @@ def main() -> None:
         scenario_rows.append(scenario_summary_row(scenario, fp_vs_gt, quant_vs_gt, action_vs_fp))
 
         layer_stats = {name: RunningDiffStats() for name in scenario.quantized_layers}
-        for fp_capture, quant_capture in zip(fp_layer_outputs, quant_layer_outputs):
+        task_layer_stats: dict[int, dict[str, RunningDiffStats]] = {}
+        for sample, fp_capture, quant_capture in zip(samples, fp_layer_outputs, quant_layer_outputs):
+            task_id = sample_task_id(sample) if args.split_by_task else None
+            if task_id is not None and task_id not in task_layer_stats:
+                task_layer_stats[task_id] = {
+                    name: RunningDiffStats() for name in scenario.quantized_layers
+                }
             for layer_name in scenario.quantized_layers:
                 if layer_name not in fp_capture or layer_name not in quant_capture:
                     raise KeyError(f"Missing captured output for layer {layer_name}")
                 layer_stats[layer_name].update(fp_capture[layer_name], quant_capture[layer_name])
+                if task_id is not None:
+                    task_layer_stats[task_id][layer_name].update(
+                        fp_capture[layer_name], quant_capture[layer_name]
+                    )
 
         for layer_name in scenario.quantized_layers:
             layer_row = {
@@ -966,9 +1055,63 @@ def main() -> None:
             layer_row.update(layer_stats[layer_name].to_dict("wx"))
             per_layer_rows.append(layer_row)
 
+        if args.split_by_task:
+            for task_id, sample in sorted(task_samples.items()):
+                task_row = scenario_summary_row(
+                    scenario,
+                    None,
+                    task_quant_vs_gt.get(task_id),
+                    task_action_vs_fp.get(task_id),
+                )
+                task_row.update(
+                    {
+                        "task_id": task_id,
+                        "task_label": sample_task_label(sample),
+                        "task_suite": sample.get("task_suite", args.task_suite_name),
+                        "language": sample.get("language", ""),
+                    }
+                )
+                task_scenario_rows.append(task_row)
+
+                if task_id not in task_layer_stats:
+                    continue
+                for layer_name in scenario.quantized_layers:
+                    layer_row = {
+                        "scenario": scenario.name,
+                        "mode": scenario.mode,
+                        "layer_name": layer_name,
+                        "family": classify_layer(layer_name),
+                        "quantized": True,
+                        "focus_layer": scenario.focus_layer == layer_name,
+                        "num_quantized_layers": len(scenario.quantized_layers),
+                        "task_id": task_id,
+                        "task_label": sample_task_label(sample),
+                        "task_suite": sample.get("task_suite", args.task_suite_name),
+                        "language": sample.get("language", ""),
+                    }
+                    layer_row.update(weight_metrics.get(layer_name, {}))
+                    layer_row.update(task_layer_stats[task_id][layer_name].to_dict("wx"))
+                    task_per_layer_rows.append(layer_row)
+
     write_csv(output_dir / "scenario_summary.csv", scenario_rows)
     write_jsonl(output_dir / "per_layer_metrics.jsonl", per_layer_rows)
     write_json(output_dir / "scenario_summary.json", scenario_rows)
+    if args.split_by_task:
+        write_csv(output_dir / "task_scenario_summary.csv", task_scenario_rows)
+        write_json(output_dir / "task_scenario_summary.json", task_scenario_rows)
+        write_jsonl(output_dir / "task_per_layer_metrics.jsonl", task_per_layer_rows)
+        write_json(
+            output_dir / "task_manifest.json",
+            [
+                {
+                    "task_id": task_id,
+                    "task_label": sample_task_label(sample),
+                    "task_suite": sample.get("task_suite", args.task_suite_name),
+                    "language": sample.get("language", ""),
+                }
+                for task_id, sample in sorted(task_samples.items())
+            ],
+        )
 
     print(f"[Layerwise] Wrote results to {output_dir}")
     print(f"[Layerwise] Scenario summary: {output_dir / 'scenario_summary.csv'}")

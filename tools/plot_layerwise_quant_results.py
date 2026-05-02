@@ -73,6 +73,35 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def save_fig(fig: plt.Figure, out_dir: Path, stem: str) -> None:
     fig.savefig(out_dir / f"{stem}.png")
     fig.savefig(out_dir / f"{stem}.pdf")
@@ -291,16 +320,16 @@ def plot_family_breakdown(out_dir: Path, individual_focus_rows: list[dict[str, A
     save_fig(fig, out_dir, "family_sensitivity")
 
 
-def main() -> None:
-    args = parse_args()
-    results_dir = Path(args.results_dir)
-    plots_dir = results_dir / "plots"
+def generate_plot_bundle(
+    output_dir: Path,
+    scenario_rows: list[dict[str, Any]],
+    per_layer_rows: list[dict[str, Any]],
+    top_k: int,
+) -> dict[str, Any]:
+    plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    scenario_rows = load_json(results_dir / "scenario_summary.json")
-    per_layer_rows = load_jsonl(results_dir / "per_layer_metrics.jsonl")
     merged_rows = attach_action_metrics(scenario_rows, per_layer_rows)
-
     scenario_map = scenario_index_map(scenario_rows)
     for row in merged_rows:
         row["scenario_index"] = scenario_map.get(row["scenario"], -1)
@@ -311,20 +340,65 @@ def main() -> None:
     individual_focus_rows.sort(key=lambda row: row.get("scenario_index", 10**9))
 
     plot_scenario_trends(plots_dir, scenario_rows)
-    plot_top_layer_bars(plots_dir, individual_focus_rows, args.top_k)
-    plot_weight_wx_bars(plots_dir, individual_focus_rows, args.top_k)
+    plot_top_layer_bars(plots_dir, individual_focus_rows, top_k)
+    plot_weight_wx_bars(plots_dir, individual_focus_rows, top_k)
     plot_wx_vs_action_scatter(plots_dir, individual_focus_rows)
     plot_family_breakdown(plots_dir, individual_focus_rows)
-    summarize_tables(plots_dir, scenario_rows, individual_focus_rows, args.top_k)
+    summarize_tables(plots_dir, scenario_rows, individual_focus_rows, top_k)
 
     manifest = {
         "plots_dir": str(plots_dir),
         "generated_files": sorted(path.name for path in plots_dir.iterdir() if path.is_file()),
     }
-    with open(plots_dir / "plot_manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+    write_json(plots_dir / "plot_manifest.json", manifest)
+    return manifest
 
-    print(f"[Plot] Wrote plots to {plots_dir}")
+
+def main() -> None:
+    args = parse_args()
+    results_dir = Path(args.results_dir)
+    scenario_rows = load_json(results_dir / "scenario_summary.json")
+    per_layer_rows = load_jsonl(results_dir / "per_layer_metrics.jsonl")
+    generate_plot_bundle(results_dir, scenario_rows, per_layer_rows, args.top_k)
+    print(f"[Plot] Wrote plots to {results_dir / 'plots'}")
+
+    task_scenario_path = results_dir / "task_scenario_summary.json"
+    task_per_layer_path = results_dir / "task_per_layer_metrics.jsonl"
+    if task_scenario_path.exists() and task_per_layer_path.exists():
+        task_scenario_rows = load_json(task_scenario_path)
+        task_per_layer_rows = load_jsonl(task_per_layer_path)
+        task_ids = sorted({int(row["task_id"]) for row in task_scenario_rows if "task_id" in row})
+        by_task_dir = results_dir / "by_task"
+        by_task_dir.mkdir(parents=True, exist_ok=True)
+        task_manifest: list[dict[str, Any]] = []
+
+        for task_id in task_ids:
+            scenario_subset = [row for row in task_scenario_rows if int(row.get("task_id", -1)) == task_id]
+            per_layer_subset = [row for row in task_per_layer_rows if int(row.get("task_id", -1)) == task_id]
+            if not scenario_subset:
+                continue
+
+            task_label = next(
+                (row.get("task_label", f"task_{task_id:02d}") for row in scenario_subset if row.get("task_label")),
+                f"task_{task_id:02d}",
+            )
+            task_dir = by_task_dir / task_label
+            write_json(task_dir / "scenario_summary.json", scenario_subset)
+            write_csv(task_dir / "scenario_summary.csv", scenario_subset)
+            write_jsonl(task_dir / "per_layer_metrics.jsonl", per_layer_subset)
+            generate_plot_bundle(task_dir, scenario_subset, per_layer_subset, args.top_k)
+
+            task_manifest.append(
+                {
+                    "task_id": task_id,
+                    "task_label": task_label,
+                    "task_dir": str(task_dir),
+                    "language": next((row.get("language", "") for row in scenario_subset if row.get("language")), ""),
+                }
+            )
+
+        write_json(by_task_dir / "task_manifest.json", task_manifest)
+        print(f"[Plot] Wrote per-task plots to {by_task_dir}")
 
 
 if __name__ == "__main__":

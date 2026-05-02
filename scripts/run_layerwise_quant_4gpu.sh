@@ -6,12 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/common_paths.sh"
 
-quantvla_activate_env groot_test
+quantvla_activate_env quantvla
 quantvla_export_pythonpath
 quantvla_setup_cache_dirs
 quantvla_setup_libero_config
 CONDA_ROOT="$(quantvla_find_conda_root)"
-PYTHON_BIN="${CONDA_ROOT}/envs/groot_test/bin/python"
+PYTHON_BIN="${CONDA_ROOT}/envs/quantvla/bin/python"
 
 if [ ! -x "${PYTHON_BIN}" ]; then
     echo "Expected python not found at ${PYTHON_BIN}"
@@ -28,6 +28,7 @@ DATASET_PATH="${DATASET_PATH:-/work/mingze/LIBERO/datasets/lerobot_libero_10}"
 TASK_SUITE_NAME="${TASK_SUITE_NAME:-libero_10}"
 LIBERO_NUM_TRIALS_PER_TASK="${LIBERO_NUM_TRIALS_PER_TASK:-5}"
 LIBERO_NUM_STEPS_WAIT="${LIBERO_NUM_STEPS_WAIT:-10}"
+LIBERO_SAMPLING_MODE="${LIBERO_SAMPLING_MODE:-sequential}"
 LIBERO_RESOLUTION="${LIBERO_RESOLUTION:-256}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${QUANTVLA_ROOT}/results/layerwise_quant_4gpu}"
 DATA_CONFIG="${DATA_CONFIG:-examples.Libero.custom_data_config:LiberoDataConfig}"
@@ -51,6 +52,7 @@ MAX_LAYERS="${MAX_LAYERS:-0}"
 PACKDIR="${PACKDIR:-${QUANTVLA_ROOT}/duquant_packed_full_llm_dit_mlp_w4a8_b64c32ls015_long_0}"
 SEED="${SEED:-42}"
 AUTO_PLOT="${AUTO_PLOT:-1}"
+SPLIT_BY_TASK="${SPLIT_BY_TASK:-0}"
 INCLUDE_REGEX="${INCLUDE_REGEX:-.*(backbone\\.eagle_model\\.language_model\\..*\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)|action_head\\.model\\.transformer_blocks\\.\\d+\\.(attn1\\.(to_q|to_k|to_v|to_out\\.0)|ff\\.net\\.(0\\.proj|2))).*}"
 EXCLUDE_REGEX="${EXCLUDE_REGEX:-(?:^|\\.)(vision|radio|norm|ln|layernorm|embed|lm_head|timestep_encoder|state_encoder|action_encoder|action_decoder|pos_embed|vl_self_attention|vlln|future_tokens)(?:\\.|$)}"
 EXTRA_EXCLUDE_REGEX="${EXTRA_EXCLUDE_REGEX:-}"
@@ -80,6 +82,7 @@ COMMON_ARGS=(
     --task-suite-name "${TASK_SUITE_NAME}"
     --libero-num-trials-per-task "${LIBERO_NUM_TRIALS_PER_TASK}"
     --libero-num-steps-wait "${LIBERO_NUM_STEPS_WAIT}"
+    --libero-sampling-mode "${LIBERO_SAMPLING_MODE}"
     --libero-resolution "${LIBERO_RESOLUTION}"
     --data-config "${DATA_CONFIG}"
     --embodiment-tag "${EMBODIMENT_TAG}"
@@ -104,6 +107,10 @@ COMMON_ARGS=(
     --exclude-regex "${EXCLUDE_REGEX}"
 )
 
+if [ "${SPLIT_BY_TASK}" = "1" ]; then
+    COMMON_ARGS+=(--split-by-task)
+fi
+
 echo "========================================"
 echo "4-GPU Layerwise Quant Launcher"
 echo "========================================"
@@ -116,6 +123,7 @@ echo "Modes      : ${MODES}"
 echo "GPUs       : ${GPU_LIST}"
 echo "Plan GPU   : ${PLAN_GPU}"
 echo "Samples    : ${NUM_SAMPLES}"
+echo "Libero Samp: ${LIBERO_SAMPLING_MODE}"
 echo "Layers     : start=${START_LAYER} max=${MAX_LAYERS}"
 echo "Python     : ${PYTHON_BIN}"
 echo "Include RX : ${INCLUDE_REGEX}"
@@ -218,6 +226,8 @@ scenario_order = {row["scenario"]: i for i, row in enumerate(scenario_plan)}
 
 summary_rows = []
 per_layer_rows = []
+task_summary_rows = []
+task_per_layer_rows = []
 for shard_id in shard_ids:
     shard_dir = output_root / f"shard_{shard_id}"
 
@@ -233,6 +243,19 @@ for shard_id in shard_ids:
                 line = line.strip()
                 if line:
                     per_layer_rows.append(json.loads(line))
+
+    task_summary_path = shard_dir / "task_scenario_summary.json"
+    if task_summary_path.exists():
+        with open(task_summary_path, "r") as f:
+            task_summary_rows.extend(json.load(f))
+
+    task_per_layer_path = shard_dir / "task_per_layer_metrics.jsonl"
+    if task_per_layer_path.exists():
+        with open(task_per_layer_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    task_per_layer_rows.append(json.loads(line))
 
 baseline_rows = [row for row in summary_rows if row.get("mode") == "baseline"]
 non_baseline_rows = [row for row in summary_rows if row.get("mode") != "baseline"]
@@ -252,6 +275,43 @@ with open(output_root / "scenario_summary.json", "w") as f:
 with open(output_root / "per_layer_metrics.jsonl", "w") as f:
     for row in per_layer_rows:
         f.write(json.dumps(row) + "\n")
+
+if task_summary_rows:
+    task_baseline_rows = [row for row in task_summary_rows if row.get("mode") == "baseline"]
+    task_non_baseline_rows = [row for row in task_summary_rows if row.get("mode") != "baseline"]
+    task_non_baseline_rows.sort(
+        key=lambda row: (
+            int(row.get("task_id", 10**9)),
+            scenario_order.get(row["scenario"], 10**9),
+        )
+    )
+    task_summary_rows = task_baseline_rows + task_non_baseline_rows
+    with open(output_root / "task_scenario_summary.json", "w") as f:
+        json.dump(task_summary_rows, f, indent=2)
+
+    import csv
+    task_fieldnames = []
+    for row in task_summary_rows:
+        for key in row.keys():
+            if key not in task_fieldnames:
+                task_fieldnames.append(key)
+    with open(output_root / "task_scenario_summary.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=task_fieldnames)
+        writer.writeheader()
+        for row in task_summary_rows:
+            writer.writerow(row)
+
+if task_per_layer_rows:
+    task_per_layer_rows.sort(
+        key=lambda row: (
+            int(row.get("task_id", 10**9)),
+            scenario_order.get(row["scenario"], 10**9),
+            row.get("layer_name", ""),
+        )
+    )
+    with open(output_root / "task_per_layer_metrics.jsonl", "w") as f:
+        for row in task_per_layer_rows:
+            f.write(json.dumps(row) + "\n")
 
 fieldnames = []
 for row in summary_rows:

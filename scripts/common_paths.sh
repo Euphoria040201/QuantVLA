@@ -79,7 +79,7 @@ quantvla_export_pythonpath() {
 }
 
 quantvla_setup_cache_dirs() {
-    local cache_root="${QUANTVLA_CACHE_ROOT:-/work/mingze/.cache/quantvla}"
+    local cache_root="${QUANTVLA_CACHE_ROOT:-/data/ziyu/.cache/quantvla}"
     mkdir -p "${cache_root}/huggingface" "${cache_root}/torch" "${cache_root}/xdg"
 
     export QUANTVLA_CACHE_ROOT="${cache_root}"

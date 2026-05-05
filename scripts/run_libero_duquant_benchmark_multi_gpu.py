@@ -85,6 +85,7 @@ def make_base_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
     env.pop("VIRTUAL_ENV", None)
+    env["TOKENIZERS_PARALLELISM"] = env.get("TOKENIZERS_PARALLELISM", "false")
 
     pythonpath_entries = [str(QUANTVLA_ROOT)]
     if LIBERO_ROOT.exists():
@@ -103,6 +104,13 @@ def make_base_env() -> dict[str, str]:
     env["LIBERO_CONFIG_PATH"] = env.get("LIBERO_CONFIG_PATH", "/work/mingze/.libero")
     env["LIBERO_ROOT"] = str(LIBERO_ROOT)
     env["MPLCONFIGDIR"] = f"{cache_root}/matplotlib"
+    env["GR00T_CPU_THREADS"] = env.get("GR00T_CPU_THREADS", "4")
+    env["GR00T_INTEROP_THREADS"] = env.get("GR00T_INTEROP_THREADS", "1")
+    env["OMP_NUM_THREADS"] = env.get("OMP_NUM_THREADS", env["GR00T_CPU_THREADS"])
+    env["MKL_NUM_THREADS"] = env.get("MKL_NUM_THREADS", env["GR00T_CPU_THREADS"])
+    env["OPENBLAS_NUM_THREADS"] = env.get("OPENBLAS_NUM_THREADS", env["GR00T_CPU_THREADS"])
+    env["NUMEXPR_NUM_THREADS"] = env.get("NUMEXPR_NUM_THREADS", env["GR00T_CPU_THREADS"])
+    env["OMP_WAIT_POLICY"] = env.get("OMP_WAIT_POLICY", "PASSIVE")
 
     for key in (
         env["HF_HOME"],

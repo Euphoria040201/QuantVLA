@@ -74,6 +74,13 @@ from gr00t.experiment.data_config import load_data_config  # noqa: E402
 from gr00t.model.policy import COMPUTE_DTYPE, unsqueeze_dict_values  # noqa: E402
 from gr00t.quantization.duquant_layers import select_targets  # noqa: E402
 
+DEFAULT_LIBERO_ROOT = os.environ.get("LIBERO_ROOT", "/work/mingze/LIBERO")
+DEFAULT_LIBERO_DATASET = f"{DEFAULT_LIBERO_ROOT}/datasets/lerobot_libero_10"
+DEFAULT_QUANTVLA_ROOT = os.environ.get("QUANTVLA_ROOT", "/work/mingze/QuantVLA")
+DEFAULT_SCAN_DIR = (
+    f"{DEFAULT_QUANTVLA_ROOT}/results/layerwise_quant_2gpu_taskwise_s10_w3a8_gpu67"
+)
+
 
 # ---------------------------------------------------------------------------
 # Args
@@ -83,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", default="")
     p.add_argument("--data-source", default="libero", choices=["libero"])
-    p.add_argument("--dataset-path", default="/work/mingze/LIBERO/datasets/lerobot_libero_10")
+    p.add_argument("--dataset-path", default=DEFAULT_LIBERO_DATASET)
     p.add_argument("--task-suite-name", default="libero_10")
     p.add_argument("--data-config", default="examples.Libero.custom_data_config:LiberoDataConfig")
     p.add_argument("--embodiment-tag", default="new_embodiment")
@@ -115,7 +122,7 @@ def parse_args() -> argparse.Namespace:
                    help="Random extra layers for spectrum baseline.")
 
     p.add_argument("--scan-dir",
-                   default="/work/mingze/QuantVLA/results/layerwise_quant_2gpu_taskwise_s10_w3a8_gpu67",
+                   default=DEFAULT_SCAN_DIR,
                    help="Existing layerwise scan directory (for RMSE join).")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--plot-only", action="store_true",

@@ -20,6 +20,24 @@ from gr00t.eval.service import BaseInferenceClient, BaseInferenceServer
 from gr00t.model.policy import BasePolicy
 
 
+def _cast_obs_float64_to_float32(value: Any) -> Any:
+    """Normalize eval observations so policy transforms see consistent float32 tensors."""
+    import numpy as np
+    import torch
+
+    if isinstance(value, dict):
+        return {k: _cast_obs_float64_to_float32(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_cast_obs_float64_to_float32(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_cast_obs_float64_to_float32(v) for v in value)
+    if isinstance(value, np.ndarray) and value.dtype == np.float64:
+        return value.astype(np.float32, copy=False)
+    if isinstance(value, torch.Tensor) and value.dtype == torch.float64:
+        return value.to(dtype=torch.float32)
+    return value
+
+
 class RobotInferenceServer(BaseInferenceServer):
     """
     Server with three endpoints for real robot policies
@@ -27,7 +45,11 @@ class RobotInferenceServer(BaseInferenceServer):
 
     def __init__(self, model, host: str = "*", port: int = 5555, api_token: str = None):
         super().__init__(host, port, api_token)
-        self.register_endpoint("get_action", model.get_action)
+        def _wrapped_get_action(obs):
+            obs = _cast_obs_float64_to_float32(obs)
+            return model.get_action(obs)
+
+        self.register_endpoint("get_action", _wrapped_get_action)
         self.register_endpoint(
             "get_modality_config", model.get_modality_config, requires_input=False
         )

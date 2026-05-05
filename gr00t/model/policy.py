@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -197,6 +198,53 @@ class Gr00tPolicy(BasePolicy):
     def _get_unnormalized_action(self, normalized_action: torch.Tensor) -> Dict[str, Any]:
         return self.unapply_transforms({"action": normalized_action.cpu()})
 
+    def warmup(self, num_steps: int = 2) -> None:
+        """Run dummy forwards to populate DuQuant activation calibrators and CUDA caches.
+
+        First-call latency is dominated by per-layer ``torch.quantile`` calls
+        when activation calibration runs lazily. Triggering it once at startup
+        moves that cost out of the first real request.
+        """
+        if num_steps <= 0:
+            return
+        try:
+            modalities = getattr(self.metadata, "modalities", None)
+            if modalities is None:
+                return
+
+            video_T = max(1, len(self._video_delta_indices))
+            state_T = max(1, len(self._state_delta_indices)) if self._state_delta_indices is not None else 1
+
+            obs: Dict[str, Any] = {}
+            for full_key in self._modality_config.get("video", ModalityConfig(delta_indices=[0], modality_keys=[])).modality_keys:
+                sub = full_key.split(".", 1)[1] if "." in full_key else full_key
+                vm = modalities.video.get(sub)
+                if vm is None:
+                    continue
+                H, W = vm.resolution
+                C = vm.channels
+                obs[full_key] = np.zeros((video_T, H, W, C), dtype=np.uint8)
+
+            if "state" in self._modality_config:
+                for full_key in self._modality_config["state"].modality_keys:
+                    sub = full_key.split(".", 1)[1] if "." in full_key else full_key
+                    sm = modalities.state.get(sub)
+                    if sm is None:
+                        continue
+                    obs[full_key] = np.zeros((state_T,) + tuple(sm.shape), dtype=np.float32)
+
+            if "language" in self._modality_config:
+                for full_key in self._modality_config["language"].modality_keys:
+                    obs[full_key] = ["warmup"]
+
+            if not obs:
+                return
+
+            for _ in range(num_steps):
+                self.get_action(obs)
+        except Exception as exc:
+            print(f"[Gr00tPolicy] warmup skipped: {exc}")
+
     def get_modality_config(self) -> Dict[str, ModalityConfig]:
         """
         Get the modality config for the model, overrides the base class method
@@ -281,12 +329,28 @@ class Gr00tPolicy(BasePolicy):
         except Exception as e:
             print(f"[GR00T] Failed to patch attention for ATM support: {e}")
 
-        # Apply DuQuant W4A8 quantization if configured via environment variables
-        # This must be done BEFORE moving model to device
-        # IMPORTANT: This is called AFTER action_head recreation to ensure DiT layers are quantized
+        # Apply ASPQ-GPTQ or DuQuant quantization if configured via environment variables.
+        # This must be done BEFORE moving model to device.
+        # IMPORTANT: This is called AFTER action_head recreation to ensure DiT layers are quantized.
+        aspq_gptq_requested = os.environ.get("GR00T_ASPQ_GPTQ", "0") not in ("0", "false", "False")
+        aspq_gptq_applied = False
         try:
-            from gr00t.quantization import enable_duquant_if_configured
-            enable_duquant_if_configured(model)
+            from gr00t.quantization import enable_aspq_gptq_if_configured
+
+            aspq_gptq_applied = enable_aspq_gptq_if_configured(model)
+        except Exception as e:
+            if aspq_gptq_requested:
+                raise RuntimeError(f"ASPQ-GPTQ requested but failed to apply: {e}") from e
+            print(f"[GR00T] ASPQ-GPTQ not enabled or failed to apply: {e}")
+
+        try:
+            if aspq_gptq_applied:
+                print("[GR00T] ASPQ-GPTQ applied; skipping DuQuant replacement")
+            elif aspq_gptq_requested:
+                print("[GR00T] ASPQ-GPTQ was requested; skipping DuQuant fallback")
+            else:
+                from gr00t.quantization import enable_duquant_if_configured
+                enable_duquant_if_configured(model)
         except Exception as e:
             print(f"[GR00T] DuQuant not enabled or failed to apply: {e}")
 

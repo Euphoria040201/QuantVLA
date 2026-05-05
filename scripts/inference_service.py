@@ -40,6 +40,7 @@ You can use bore to forward the port to your client: `159.223.171.199` is bore.p
     bore local 8000 --to 159.223.171.199
 """
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -92,8 +93,30 @@ class ArgsConfig:
     http_server: bool = False
     """Whether to run it as HTTP server. Default is ZMQ server."""
 
+    warmup_steps: int = 2
+    """Number of dummy forwards to run before serving (populates DuQuant activation calibration). Set 0 to disable."""
+
 
 #####################################################################################
+
+
+def _configure_runtime_threads() -> None:
+    """Bound CPU thread pools for inference workers.
+
+    The benchmark launcher may place one inference service per GPU. Leaving
+    PyTorch and BLAS thread pools unconstrained can cause each worker to fan
+    out across dozens of CPU threads, which leads to severe oversubscription on
+    multi-GPU runs.
+    """
+    import torch
+
+    cpu_threads = int(os.environ.get("GR00T_CPU_THREADS", "0"))
+    interop_threads = int(os.environ.get("GR00T_INTEROP_THREADS", "0"))
+
+    if cpu_threads > 0:
+        torch.set_num_threads(cpu_threads)
+    if interop_threads > 0:
+        torch.set_num_interop_threads(interop_threads)
 
 
 def _example_zmq_client_call(obs: dict, host: str, port: int, api_token: str):
@@ -140,6 +163,8 @@ def _example_http_client_call(obs: dict, host: str, port: int, api_token: str):
 
 def main(args: ArgsConfig):
     if args.server:
+        _configure_runtime_threads()
+
         # Create a policy
         # The `Gr00tPolicy` class is being used to create a policy object that encapsulates
         # the model path, transform name, embodiment tag, and denoising steps for the robot
@@ -162,6 +187,12 @@ def main(args: ArgsConfig):
             embodiment_tag=args.embodiment_tag,
             denoising_steps=args.denoising_steps,
         )
+
+        if args.warmup_steps > 0:
+            print(f"[inference_service] Warming up policy ({args.warmup_steps} steps)...")
+            t0 = time.time()
+            policy.warmup(num_steps=args.warmup_steps)
+            print(f"[inference_service] Warmup done in {time.time() - t0:.2f}s")
 
         # Start the server
         if args.http_server:

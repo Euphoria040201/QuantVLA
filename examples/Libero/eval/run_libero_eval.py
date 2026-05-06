@@ -79,10 +79,14 @@ class GenerateConfig:
     summary_json: str | None = None
     """Whether to save rollout mp4 videos."""
     save_videos: bool = True
+    """How to decode the action payload returned by the inference server."""
+    policy_output_format: str = "gr00t_dict"
+    """Key to read when the server returns a dict-wrapped vector action."""
+    response_action_key: str = "action"
 
 
-class GR00TPolicy:
-    """GR00T Policy wrapper for Libero environments."""
+class ExternalPolicy:
+    """External policy wrapper for Libero environments."""
 
     LIBERO_CONFIG = {
         "proprio_size": 8,
@@ -97,16 +101,25 @@ class GR00TPolicy:
         },
     }
 
-    def __init__(self, host="localhost", port=5555, headless=False):
+    def __init__(
+        self,
+        host="localhost",
+        port=5555,
+        headless=False,
+        policy_output_format: str = "gr00t_dict",
+        response_action_key: str = "action",
+    ):
         from gr00t.eval.service import ExternalRobotInferenceClient
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
         self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
+        self.policy_output_format = policy_output_format
+        self.response_action_key = response_action_key
 
     def get_action(self, observation_dict, lang: str):
-        """Get action from GR00T policy given observation and language instruction."""
+        """Get action from the external policy given observation and language instruction."""
         obs_dict = self._process_observation(observation_dict, lang)
         # summarize_obs(obs_dict)
         action_chunk = self.policy.get_action(obs_dict)
@@ -137,21 +150,54 @@ class GR00TPolicy:
     def _convert_to_libero_action(
         self, action_chunk: dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
-        """Convert GR00T action chunk to Libero format.
+        """Convert an external action payload to Libero format.
 
         Args:
-            action_chunk: Dictionary of action components from GR00T policy
+            action_chunk: Action payload returned by the server
             idx: Index of action to extract from chunk (default: 0 for first action)
 
         Returns:
             7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
         """
-        action_components = [
-            np.atleast_1d(action_chunk[f"action.{key}"][idx])[0] for key in self.action_keys
-        ]
-        action_array = np.array(action_components, dtype=np.float32)
+        if self.policy_output_format == "vector7":
+            action_array = self._extract_vector_action(action_chunk, idx)
+        else:
+            action_components = [self._extract_named_component(action_chunk, key, idx) for key in self.action_keys]
+            action_array = np.array(action_components, dtype=np.float32)
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
+        return action_array
+
+    def _extract_named_component(self, action_chunk, key: str, idx: int) -> float:
+        if not isinstance(action_chunk, dict):
+            raise TypeError(
+                f"Expected dict action payload for format '{self.policy_output_format}', "
+                f"got {type(action_chunk).__name__}"
+            )
+        for candidate in (f"action.{key}", key):
+            if candidate in action_chunk:
+                return float(np.atleast_1d(action_chunk[candidate])[idx])
+        raise KeyError(f"Could not find action component '{key}' in server response")
+
+    def _extract_vector_action(self, action_chunk, idx: int) -> np.ndarray:
+        payload = action_chunk
+        if isinstance(action_chunk, dict):
+            if self.response_action_key in action_chunk:
+                payload = action_chunk[self.response_action_key]
+            elif "actions" in action_chunk:
+                payload = action_chunk["actions"]
+            elif len(action_chunk) == 1:
+                payload = next(iter(action_chunk.values()))
+
+        action_array = np.asarray(payload, dtype=np.float32)
+        if action_array.ndim == 2:
+            action_array = action_array[idx]
+        elif action_array.ndim > 2:
+            raise ValueError(
+                f"Expected vector action with rank <= 2, got shape {action_array.shape}"
+            )
+        if action_array.shape[-1] != 7:
+            raise ValueError(f"Expected vector action with final dim 7, got shape {action_array.shape}")
         return action_array
 
 
@@ -198,7 +244,13 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, resolution=256)
 
-        gr00t_policy = GR00TPolicy(host="localhost", port=cfg.port, headless=cfg.headless)
+        policy = ExternalPolicy(
+            host="localhost",
+            port=cfg.port,
+            headless=cfg.headless,
+            policy_output_format=cfg.policy_output_format,
+            response_action_key=cfg.response_action_key,
+        )
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -247,7 +299,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     wrist_view.append(wrist_img)
 
                     # Query model to get action
-                    action = gr00t_policy.get_action(
+                    action = policy.get_action(
                         obs,
                         task.language,
                     )

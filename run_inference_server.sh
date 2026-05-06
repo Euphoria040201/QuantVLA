@@ -12,7 +12,7 @@ source "${SCRIPT_DIR}/scripts/common_paths.sh"
 TASK=${1:-libero_10}
 
 # Activate groot_test environment
-quantvla_activate_env groot_test
+quantvla_activate_env "${QUANTVLA_ENV:-quantvla}"
 quantvla_export_pythonpath
 quantvla_setup_cache_dirs
 quantvla_setup_libero_config

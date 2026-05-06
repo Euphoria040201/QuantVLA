@@ -126,6 +126,10 @@ def fake_quantize_sym(
 ) -> torch.Tensor:
     if bits <= 0:
         return x
+    # Hot path: skip the profiler closure + dict lookup when profiling is off.
+    if not _DUQUANT_PROFILER.enabled:
+        max_q = qmax(bits)
+        return torch.clamp(torch.round(x / scale), -max_q - 1, max_q) * scale
 
     def _impl() -> torch.Tensor:
         max_q = qmax(bits)

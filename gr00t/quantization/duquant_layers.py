@@ -232,7 +232,31 @@ class DuQuantLinear(nn.Module):
         self.in_features = base.in_features
         self.out_features = base.out_features
         self.bias = nn.Parameter(base.bias.detach().clone()) if base.bias is not None else None
-        self.register_buffer("_weight", base.weight.detach().clone())
+        # SmoothQuant absorption: pre-divide x by s, pre-multiply W column-wise by s
+        # We modify the weight HERE before pack so DuQuant rotation is computed on the rescaled W.
+        _w_for_pack = base.weight.detach().clone()
+        self._sq_s_inv: Optional[torch.Tensor] = None
+        sq_path = os.environ.get("GR00T_DUQUANT_SMOOTHQUANT_PATH", "")
+        if sq_path and os.path.exists(sq_path):
+            try:
+                _sq_alpha = float(os.environ.get("GR00T_DUQUANT_SMOOTHQUANT_ALPHA", "0.5"))
+                _sq_clip = float(os.environ.get("GR00T_DUQUANT_SMOOTHQUANT_CLIP", "1e3"))
+                _sq_min = 1.0 / _sq_clip
+                _sq_data = torch.load(sq_path, map_location="cpu", weights_only=False)
+                _rec = _sq_data.get(name, None)
+                if _rec is not None and "act_max" in _rec and "weight_max" in _rec:
+                    a = _rec["act_max"].float().clamp(min=1e-5)
+                    w_col = _rec["weight_max"].float().clamp(min=1e-5)
+                    s = (a.pow(_sq_alpha) / w_col.pow(1.0 - _sq_alpha)).clamp(min=_sq_min, max=_sq_clip)
+                    # scale weight columns (input dim) by s
+                    s_dev = s.to(dtype=_w_for_pack.dtype)
+                    _w_for_pack = _w_for_pack * s_dev[None, :]
+                    self.register_buffer("_sq_s_inv", (1.0 / s_dev).clone(), persistent=False)
+                    if os.environ.get("GR00T_DUQUANT_DEBUG", "0") not in ("0", "false", "False"):
+                        print(f"[GR00T-SQ] {name} alpha={_sq_alpha} s_min={float(s.min()):.3e} s_max={float(s.max()):.3e} a_max={float(a.max()):.3f} w_max={float(w_col.max()):.3f}", flush=True)
+            except Exception as _e:
+                print(f"[GR00T-SQ][WARN] {name}: {_e}", flush=True)
+        self.register_buffer("_weight", _w_for_pack)
 
         # Config
         self.cfg = cfg
@@ -277,6 +301,39 @@ class DuQuantLinear(nn.Module):
         self._block_size = int(pack.meta.get("block_size", 16))
         self._block_out_size = int(pack.meta.get("block_out_size", self._block_size))
 
+        # Pre-build a single stacked rotation buffer per side. The hot path of every
+        # forward used to do `torch.stack([R_in_cache[b] for b in range(n_blocks)])`,
+        # which dominated CPU time when there are O(1k) Linear layers per step.
+        # Building it once here removes that overhead entirely.
+        # PyTorch >= 2.5 rejects register_buffer if the name is already a regular
+        # attribute, so we register the buffer up-front (with None) before the
+        # conditional branch.
+        self.register_buffer("_R_in_stack", None, persistent=False)
+        if pack.R_in_blocks and self.in_features % self._block_size == 0:
+            n_in_blocks = self.in_features // self._block_size
+            if all(b in pack.R_in_blocks for b in range(n_in_blocks)) and all(
+                pack.R_in_blocks[b].shape == (self._block_size, self._block_size)
+                for b in range(n_in_blocks)
+            ):
+                stack_in = torch.stack(
+                    [torch.from_numpy(pack.R_in_blocks[b]) for b in range(n_in_blocks)],
+                    dim=0,
+                ).to(dtype=self._weight.dtype).contiguous()
+                self._R_in_stack = stack_in
+
+        self.register_buffer("_R_out_stack", None, persistent=False)
+        if pack.R_out_blocks and self.out_features % self._block_out_size == 0:
+            n_out_blocks = self.out_features // self._block_out_size
+            if all(b in pack.R_out_blocks for b in range(n_out_blocks)) and all(
+                pack.R_out_blocks[b].shape == (self._block_out_size, self._block_out_size)
+                for b in range(n_out_blocks)
+            ):
+                stack_out = torch.stack(
+                    [torch.from_numpy(pack.R_out_blocks[b]) for b in range(n_out_blocks)],
+                    dim=0,
+                ).to(dtype=self._weight.dtype).contiguous()
+                self._R_out_stack = stack_out
+
         # Calibrator for activation
         self.calibrator = PercentileCalibrator(
             percentile=cfg.act_percentile, max_batches=cfg.calib_batches
@@ -302,6 +359,15 @@ class DuQuantLinear(nn.Module):
         self._bias_rot: Optional[torch.Tensor] = None
         self._debug_enabled = os.environ.get("GR00T_DUQUANT_DEBUG", "0") not in ("0", "false", "False")
         self._debug_forward_logged = False
+        # Resolve hot-path env flags ONCE at construction. Reading os.environ on every
+        # forward is itself a measurable cost when called O(1k * denoising_steps) times.
+        self._layer_stats_enabled = os.environ.get("GR00T_DEBUG_LAYER_STATS", "0") not in (
+            "0", "false", "False",
+        )
+        try:
+            self._layer_stats_every = int(os.environ.get("GR00T_DEBUG_LAYER_STATS_EVERY", "200"))
+        except ValueError:
+            self._layer_stats_every = 200
         self._aspq_enabled = bool(cfg.aspq_enabled)
         self._aspq_available = False
         if self._aspq_enabled:
@@ -503,11 +569,29 @@ class DuQuantLinear(nn.Module):
         return self._act_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply optimized per-block input transform
-        from .duquant_preprocess import apply_input_transform_optimized
-        x_t = apply_input_transform_optimized(
-            x, self.pack, self._perm_cache, self._get_R_in_cache(), self._block_size
-        )
+        # SmoothQuant: pre-divide x by per-channel s (broadcast on input dim)
+        if self._sq_s_inv is not None:
+            x = x * self._sq_s_inv.to(dtype=x.dtype, device=x.device)
+
+        # Per-block input rotation. Fast path uses the prebuilt stacked tensor so we
+        # avoid Python list-comp / torch.stack overhead per layer per step.
+        if self._perm_cache is not None:
+            x = x.index_select(dim=-1, index=self._perm_cache)
+        if self._R_in_stack is not None:
+            orig_shape = x.shape
+            n_blocks = self._R_in_stack.shape[0]
+            x_t = torch.einsum(
+                "rnb,nbc->rnc",
+                x.reshape(-1, n_blocks, self._block_size),
+                self._R_in_stack,
+            ).reshape(orig_shape)
+        elif self._R_in_block_indices:
+            from .duquant_preprocess import apply_input_transform_optimized
+            x_t = apply_input_transform_optimized(
+                x, self.pack, None, self._get_R_in_cache(), self._block_size
+            )
+        else:
+            x_t = x
 
         # Fake-quantize activations if enabled
         if self.cfg.act_bits > 0:
@@ -536,10 +620,19 @@ class DuQuantLinear(nn.Module):
 
         # Apply row restore if requested
         if self.cfg.row_rot_mode == "restore" and self.pack.R_out_blocks is not None:
-            from .duquant_preprocess import apply_output_restore_optimized
-            y_lin = apply_output_restore_optimized(
-                y_lin, self.pack, self._get_R_out_cache(), self._block_out_size
-            )
+            if self._R_out_stack is not None:
+                orig_shape = y_lin.shape
+                n_out = self._R_out_stack.shape[0]
+                y_lin = torch.einsum(
+                    "rnb,nbc->rnc",
+                    y_lin.reshape(-1, n_out, self._block_out_size),
+                    self._R_out_stack,
+                ).reshape(orig_shape)
+            else:
+                from .duquant_preprocess import apply_output_restore_optimized
+                y_lin = apply_output_restore_optimized(
+                    y_lin, self.pack, self._get_R_out_cache(), self._block_out_size
+                )
             if self.bias is not None:
                 y_lin = y_lin + self.bias
         else:
@@ -557,6 +650,36 @@ class DuQuantLinear(nn.Module):
                 f"weight_bits={self.weight_bits} act_bits={self.cfg.act_bits}"
             )
             self._debug_forward_logged = True
+        # Optional per-layer stat logging (env-gated, resolved once at init)
+        if self._layer_stats_enabled:
+            try:
+                _every = self._layer_stats_every
+                _cnt = getattr(self, "_dbg_call_cnt", 0) + 1
+                self._dbg_call_cnt = _cnt
+                if _cnt == 1 or (_cnt % _every) == 0:
+                    with torch.no_grad():
+                        xa = x.detach().abs()
+                        ya = y_lin.detach()
+                        nan_cnt = int(torch.isnan(ya).sum().item())
+                        inf_cnt = int(torch.isinf(ya).sum().item())
+                        x_max = float(xa.max().item()) if xa.numel() else 0.0
+                        y_amax = float(ya.abs().max().item()) if ya.numel() else 0.0
+                        y_norm = float(ya.float().norm().item()) if ya.numel() else 0.0
+                        # crude clip rate: fraction of |x| beyond p99.9 of own batch (proxy)
+                        if xa.numel() > 1024:
+                            thr = float(torch.quantile(xa.flatten()[: min(xa.numel(), 1<<20)].float(), 0.999).item())
+                            clip_rate = float((xa > thr).float().mean().item())
+                        else:
+                            thr, clip_rate = 0.0, 0.0
+                    print(
+                        f"[LAYER] call#{_cnt} {self.name} "
+                        f"xmax={x_max:.3f} ymax={y_amax:.3f} ynorm={y_norm:.2f} "
+                        f"nan={nan_cnt} inf={inf_cnt} clip_rate@p99.9={clip_rate:.3e} "
+                        f"aspq={int(getattr(self, '_aspq_available', False))}",
+                        flush=True,
+                    )
+            except Exception as _e:
+                pass
         return y_lin
 
 

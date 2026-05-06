@@ -27,14 +27,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/scripts/common_paths.sh"
 
 cd "${QUANTVLA_ROOT}"
-quantvla_activate_env groot_test
+quantvla_activate_env "${QUANTVLA_ENV:-quantvla}"
 quantvla_export_pythonpath
 quantvla_setup_cache_dirs
 quantvla_setup_libero_config
 
 # Task configuration
 TASK_SUITE="${1:-libero_10}"
-if [ -n "$2" ]; then
+if [ -n "${2:-}" ]; then
     MODEL_PATH="$2"
 else
     case "$TASK_SUITE" in
@@ -149,7 +149,7 @@ echo "  ACT_PCT=$GR00T_DUQUANT_ACT_PCT"
 echo "  CALIB_STEPS=$GR00T_DUQUANT_CALIB_STEPS"
 echo "  LS=$GR00T_DUQUANT_LS"
 echo "  PACKDIR=$GR00T_DUQUANT_PACKDIR"
-echo "  DENOISING_STEPS=$GR00T_DENOISING_STEPS (CRITICAL for full quantization)"
+echo "  DENOISING_STEPS=${GR00T_DENOISING_STEPS:-8} (CRITICAL for full quantization)"
 echo ""
 echo "⚡ QUANTIZATION TARGET:"
 echo "  ✅ LLM (Eagle VLM) ALL linear layers (~84 layers)"
@@ -162,7 +162,7 @@ echo "⚡ FEATURES:"
 echo "  ✅ W4A8 fake quantization"
 echo "  ✅ Input permutation enabled"
 echo "  ✅ Row rotation with output restoration"
-echo "  ✅ Increased denoising steps (${GR00T_DENOISING_STEPS}) to compensate quantization noise"
+echo "  ✅ Increased denoising steps (${GR00T_DENOISING_STEPS:-8}) to compensate quantization noise"
 echo "  ❌ torch.compile DISABLED (for stability)"
 echo ""
 echo "⚠️  WARNING: Full quantization may cause accuracy drop!"

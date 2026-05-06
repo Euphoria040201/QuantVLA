@@ -110,7 +110,7 @@ def _load_quantized_record(layer_name: str, weights_path: str) -> Optional[Any]:
     container = _load_quantized_container(path)
     if not isinstance(container, dict):
         return container
-    if any(key in container for key in ("weight_q", "W_q", "quant_weight")):
+    if any(key in container for key in ("baseline_q", "weight_q", "W_q", "quant_weight")):
         return container
     for key in (layer_name, sanitize_name(layer_name)):
         if key in container:
@@ -205,6 +205,73 @@ def gptq_quantize_weight(
     return Q
 
 
+@dataclass
+class AspqGptqRecord:
+    """Factored ASPQ-GPTQ outputs for one linear layer.
+
+    Storage pieces (algorithm itself unchanged):
+      * ``baseline_q`` ∈ ℝ^[O, I]   — full GPTQ-quantized weight (on the wbit
+        integer grid, fp dense storage).
+      * ``U_int8`` ∈ ℤ^[O, k]       — int8-quantized action eigenbasis.
+      * ``U_scale`` ∈ ℝ^[k]         — per-column dequant scale for U_int8.
+      * ``action_q`` ∈ ℝ^[k, I]     — Uᵀ W after the rotated-GPTQ + un-weight
+        step (i.e. the quantized projection of W onto span(U)).
+
+    Reconstructing the original dense weight:
+        U_dq    = U_int8.float() * U_scale
+        W_q     = baseline_q + U_dq @ (action_q - U_dq.t() @ baseline_q)
+
+    When ``rank == 0`` (no usable ASPQ subspace) U_int8/U_scale/action_q are
+    empty and ``W_q == baseline_q``.
+    """
+
+    baseline_q: torch.Tensor
+    U_int8: torch.Tensor
+    U_scale: torch.Tensor
+    action_q: torch.Tensor
+
+    @property
+    def rank(self) -> int:
+        return int(self.U_int8.shape[1]) if self.U_int8.numel() > 0 else 0
+
+    def reconstruct(self) -> torch.Tensor:
+        if self.U_int8.numel() == 0:
+            return self.baseline_q.clone()
+        U_dq = self.U_int8.to(dtype=torch.float32) * self.U_scale.to(dtype=torch.float32)
+        return (
+            self.baseline_q
+            + U_dq @ (self.action_q - U_dq.t() @ self.baseline_q)
+        )
+
+
+def quantize_U_int8(U: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-column symmetric int8 quantization of a [O, k] basis.
+
+    U columns are unit-norm orthogonal so all entries lie in [-1, 1] and a
+    per-column max-abs scale is near-lossless.
+    """
+    if U.numel() == 0:
+        return (
+            torch.empty(0, 0, dtype=torch.int8, device=U.device),
+            torch.empty(0, dtype=torch.float32, device=U.device),
+        )
+    U_f = U.detach().to(dtype=torch.float32)
+    max_abs = U_f.abs().amax(dim=0).clamp_min(1e-8)
+    scale = max_abs / 127.0
+    codes = torch.clamp(torch.round(U_f / scale), -128.0, 127.0).to(torch.int8)
+    return codes, scale
+
+
+def _empty_aspq_pieces(
+    out_features: int, in_features: int, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(out_features, 0, dtype=torch.int8, device=device),
+        torch.empty(0, dtype=torch.float32, device=device),
+        torch.empty(0, in_features, dtype=torch.float32, device=device),
+    )
+
+
 def solve_aspq_gptq_weight(
     W: torch.Tensor,
     H: torch.Tensor,
@@ -215,12 +282,14 @@ def solve_aspq_gptq_weight(
     block_size: int = 128,
     damp_percent: float = 0.01,
     min_eig: float = 1e-12,
-) -> torch.Tensor:
-    """Quantize W with GPTQ, then apply an ASPQ low-rank correction.
+) -> AspqGptqRecord:
+    """Quantize W with GPTQ, then quantize the ASPQ action subspace.
 
-    If U spans the full output space this matches the paper's rotate -> GPTQ ->
-    rotate-back view. For top-k metrics we keep the baseline GPTQ solution in
-    the complement space and correct only the ASPQ-sensitive subspace.
+    Algorithm is unchanged from the original; only the return type is
+    factored so the build script can persist (baseline_q, U_int8, U_scale,
+    action_q) separately. The runtime reconstructs the same dense weight
+    from these pieces, so forward behavior matches the previous fused-tensor
+    storage.
     """
     baseline_q = gptq_quantize_weight(
         W,
@@ -229,22 +298,25 @@ def solve_aspq_gptq_weight(
         block_size=block_size,
         damp_percent=damp_percent,
     )
+    out_features, in_features = baseline_q.shape
+    device = baseline_q.device
 
     if U is None or eigvals is None or U.numel() == 0 or eigvals.numel() == 0:
-        return baseline_q
+        U_int8, U_scale, action_q = _empty_aspq_pieces(out_features, in_features, device)
+        return AspqGptqRecord(baseline_q, U_int8, U_scale, action_q)
 
-    U = U.detach().to(dtype=torch.float32, device=W.device)
-    eigvals = eigvals.detach().flatten().to(dtype=torch.float32, device=W.device)
+    U = U.detach().to(dtype=torch.float32, device=device)
+    eigvals = eigvals.detach().flatten().to(dtype=torch.float32, device=device)
     keep = torch.isfinite(eigvals) & (eigvals > float(min_eig))
-    if keep.sum().item() == 0:
-        return baseline_q
+    if int(keep.sum().item()) == 0:
+        U_int8, U_scale, action_q = _empty_aspq_pieces(out_features, in_features, device)
+        return AspqGptqRecord(baseline_q, U_int8, U_scale, action_q)
 
     U = U[:, keep]
     eigvals = eigvals[keep]
     row_weights = torch.sqrt(torch.clamp(eigvals, min=float(min_eig)))
 
     W_action = U.t() @ W.to(dtype=torch.float32)
-    baseline_action = U.t() @ baseline_q
     weighted_action = W_action * row_weights[:, None]
     weighted_action_q = gptq_quantize_weight(
         weighted_action,
@@ -253,8 +325,10 @@ def solve_aspq_gptq_weight(
         block_size=block_size,
         damp_percent=damp_percent,
     )
-    action_q = weighted_action_q / row_weights[:, None].clamp_min(float(min_eig))
-    return baseline_q + U @ (action_q - baseline_action)
+    action_q = (weighted_action_q / row_weights[:, None].clamp_min(float(min_eig))).contiguous()
+
+    U_int8, U_scale = quantize_U_int8(U)
+    return AspqGptqRecord(baseline_q=baseline_q, U_int8=U_int8, U_scale=U_scale, action_q=action_q)
 
 
 class AspqGptqLinear(nn.Module):
@@ -285,17 +359,72 @@ class AspqGptqLinear(nn.Module):
                 raise FileNotFoundError(f"No ASPQ-GPTQ record found for layer '{name}' in {cfg.path}")
             self._quant_available = False
         else:
-            weight_q = _record_get(record, ("weight_q", "W_q", "quant_weight", "weight"))
-            if weight_q is None:
-                raise ValueError(f"ASPQ-GPTQ record for '{name}' is missing quantized weight data")
-            weight_q_t = _to_tensor(weight_q).to(dtype=base.weight.dtype)
-            if tuple(weight_q_t.shape) != tuple(base.weight.shape):
-                raise ValueError(
-                    f"ASPQ-GPTQ weight for '{name}' has shape {tuple(weight_q_t.shape)}, "
-                    f"expected {tuple(base.weight.shape)}"
-                )
+            weight_q_t = self._build_weight_from_record(record, name, base.weight)
             self._weight_q.copy_(weight_q_t)
             self._quant_available = True
+
+    @staticmethod
+    def _build_weight_from_record(
+        record: Any, name: str, ref_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Materialize the dense quantized weight from an offline record.
+
+        Supports both the new factored format (baseline_q + U_int8 + U_scale +
+        action_q) and the legacy fused format (weight_q).
+        """
+        baseline_q = _record_get(record, ("baseline_q",))
+        if baseline_q is not None:
+            baseline_t = _to_tensor(baseline_q).to(dtype=torch.float32)
+            if tuple(baseline_t.shape) != tuple(ref_weight.shape):
+                raise ValueError(
+                    f"ASPQ-GPTQ baseline_q for '{name}' has shape {tuple(baseline_t.shape)}, "
+                    f"expected {tuple(ref_weight.shape)}"
+                )
+            U_int8_raw = _record_get(record, ("U_int8",))
+            U_scale_raw = _record_get(record, ("U_scale",))
+            action_q_raw = _record_get(record, ("action_q",))
+            if (
+                U_int8_raw is not None
+                and U_scale_raw is not None
+                and action_q_raw is not None
+                and _to_tensor(U_int8_raw).numel() > 0
+            ):
+                U_int8 = _to_tensor(U_int8_raw).to(dtype=torch.int8)
+                U_scale = _to_tensor(U_scale_raw).to(dtype=torch.float32)
+                action_q = _to_tensor(action_q_raw).to(dtype=torch.float32)
+                if U_int8.dim() != 2 or U_int8.shape[0] != ref_weight.shape[0]:
+                    raise ValueError(
+                        f"ASPQ-GPTQ U_int8 for '{name}' has shape {tuple(U_int8.shape)}, "
+                        f"expected [{ref_weight.shape[0]}, k]"
+                    )
+                k = int(U_int8.shape[1])
+                if U_scale.shape != (k,):
+                    raise ValueError(
+                        f"ASPQ-GPTQ U_scale for '{name}' has shape {tuple(U_scale.shape)}, "
+                        f"expected ({k},)"
+                    )
+                if action_q.shape != (k, ref_weight.shape[1]):
+                    raise ValueError(
+                        f"ASPQ-GPTQ action_q for '{name}' has shape {tuple(action_q.shape)}, "
+                        f"expected ({k}, {ref_weight.shape[1]})"
+                    )
+                U_dq = U_int8.to(dtype=torch.float32) * U_scale
+                w = baseline_t + U_dq @ (action_q - U_dq.t() @ baseline_t)
+            else:
+                w = baseline_t
+            return w.to(dtype=ref_weight.dtype)
+
+        # Legacy fused format.
+        weight_q = _record_get(record, ("weight_q", "W_q", "quant_weight", "weight"))
+        if weight_q is None:
+            raise ValueError(f"ASPQ-GPTQ record for '{name}' is missing quantized weight data")
+        weight_q_t = _to_tensor(weight_q).to(dtype=ref_weight.dtype)
+        if tuple(weight_q_t.shape) != tuple(ref_weight.shape):
+            raise ValueError(
+                f"ASPQ-GPTQ weight for '{name}' has shape {tuple(weight_q_t.shape)}, "
+                f"expected {tuple(ref_weight.shape)}"
+            )
+        return weight_q_t
 
     @property
     def weight(self) -> torch.Tensor:

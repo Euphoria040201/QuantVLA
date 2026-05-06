@@ -274,7 +274,7 @@ def main() -> None:
         U = basis[0] if basis is not None else None
         eigvals = basis[1] if basis is not None else None
         W = module.weight.detach().to(dtype=torch.float32, device=solve_device)
-        W_q = solve_aspq_gptq_weight(
+        rec = solve_aspq_gptq_weight(
             W,
             H.to(dtype=torch.float32, device=solve_device),
             bits=args.weight_bits,
@@ -284,18 +284,23 @@ def main() -> None:
             damp_percent=args.gptq_damp_percent,
             min_eig=args.min_eig,
         )
-        aspq_rank = int(U.shape[1]) if U is not None else 0
+        aspq_rank = rec.rank
         records[layer_name] = {
-            "weight_q": W_q.to(dtype=save_dtype).cpu().contiguous(),
+            "baseline_q": rec.baseline_q.to(dtype=save_dtype).cpu().contiguous(),
+            "U_int8": rec.U_int8.cpu().contiguous(),
+            "U_scale": rec.U_scale.to(dtype=save_dtype).cpu().contiguous(),
+            "action_q": rec.action_q.to(dtype=save_dtype).cpu().contiguous(),
             "weight_bits": int(args.weight_bits),
             "n_calib_tokens": int(n_tokens),
             "aspq_rank": aspq_rank,
             "gptq_block_size": int(args.gptq_block_size),
             "gptq_damp_percent": float(args.gptq_damp_percent),
+            "format_version": 2,
         }
         print(
             f"[ASPQ-GPTQ] saved {layer_name} "
-            f"(shape={tuple(W_q.shape)} calib_tokens={n_tokens} aspq_rank={aspq_rank})"
+            f"(shape={tuple(rec.baseline_q.shape)} calib_tokens={n_tokens} aspq_rank={aspq_rank} "
+            f"U_int8={tuple(rec.U_int8.shape)} action_q={tuple(rec.action_q.shape)})"
         )
 
     payload = {

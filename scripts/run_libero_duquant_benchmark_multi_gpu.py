@@ -29,6 +29,16 @@ def env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def env_json_list(name: str) -> list[str]:
+    value = os.environ.get(name)
+    if not value:
+        return []
+    parsed = json.loads(value)
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise ValueError(f"{name} must be a JSON array of strings")
+    return parsed
+
+
 def suite_defaults(task_suite: str) -> tuple[str, str, int]:
     if task_suite == "libero_spatial":
         return (
@@ -178,6 +188,18 @@ def run_shard(
     base_env = make_base_env()
     base_env["CUDA_VISIBLE_DEVICES"] = gpu
     configure_duquant_env(base_env, wbits=wbits, abits=abits, packdir=packdir)
+    inference_py = env_str("INFERENCE_PY", GROOT_PY)
+    inference_script = env_str(
+        "INFERENCE_SCRIPT", str(QUANTVLA_ROOT / "scripts" / "inference_service.py")
+    )
+    inference_cwd = env_str("INFERENCE_CWD", str(QUANTVLA_ROOT))
+    inference_extra_args = env_json_list("INFERENCE_EXTRA_ARGS_JSON")
+    eval_py = env_str("EVAL_PY", LIBERO_PY)
+    eval_script = env_str(
+        "EVAL_SCRIPT", str(QUANTVLA_ROOT / "examples" / "Libero" / "eval" / "run_libero_eval.py")
+    )
+    eval_cwd = env_str("EVAL_CWD", str(Path(eval_script).resolve().parent))
+    eval_extra_args = env_json_list("EVAL_EXTRA_ARGS_JSON")
 
     logs_dir = output_root / "logs"
     eval_log_dir = logs_dir / "eval"
@@ -194,8 +216,8 @@ def run_shard(
     with open(server_log_path, "w") as server_log:
         server_proc = subprocess.Popen(
             [
-                GROOT_PY,
-                str(QUANTVLA_ROOT / "scripts" / "inference_service.py"),
+                inference_py,
+                inference_script,
                 "--model_path",
                 model_path,
                 "--server",
@@ -207,8 +229,9 @@ def run_shard(
                 str(port),
                 "--embodiment-tag",
                 "new_embodiment",
+                *inference_extra_args,
             ],
-            cwd=str(QUANTVLA_ROOT),
+            cwd=inference_cwd,
             env=base_env,
             stdout=server_log,
             stderr=subprocess.STDOUT,
@@ -217,8 +240,8 @@ def run_shard(
     try:
         wait_for_port(port)
         eval_cmd = [
-            LIBERO_PY,
-            "run_libero_eval.py",
+            eval_py,
+            eval_script,
             "--task_suite_name",
             task_suite,
             "--num_trials_per_task",
@@ -237,6 +260,7 @@ def run_shard(
             str(rollout_dir),
             "--summary_json",
             str(summary_json_path),
+            *eval_extra_args,
         ]
         if headless:
             eval_cmd.append("--headless")
@@ -245,7 +269,7 @@ def run_shard(
         with open(eval_stdout_log_path, "w") as eval_log:
             subprocess.run(
                 eval_cmd,
-                cwd=str(QUANTVLA_ROOT / "examples" / "Libero" / "eval"),
+                cwd=eval_cwd,
                 env=base_env,
                 stdout=eval_log,
                 stderr=subprocess.STDOUT,
@@ -266,6 +290,7 @@ def merge_summaries(
     model_path: str,
     data_config: str,
     gpu_list: list[str],
+    benchmark_label: str,
     wbits: int,
     abits: int,
     num_trials: int,
@@ -302,11 +327,12 @@ def merge_summaries(
     (output_root / "merged_summary.json").write_text(json.dumps(merged, indent=2))
 
     lines = [
-        "# LIBERO DuQuant Benchmark Summary",
+        f"# LIBERO {benchmark_label} Summary",
         "",
         f"- Task suite: {task_suite}",
         f"- GPUs: {','.join(gpu_list)}",
-        f"- Quantization: W{wbits}A{abits} pure DuQuant baseline",
+        f"- Quantization: W{wbits}A{abits}",
+        f"- Benchmark: {benchmark_label}",
         f"- Episodes: {total_successes}/{total_episodes} successes ({merged['total_success_rate'] * 100:.1f}%)",
         "",
         "| task_id | success_rate | successes | episodes | task_description |",
@@ -332,6 +358,7 @@ def main() -> int:
     denoising_steps = env_int("DENOISING_STEPS", 8)
     wbits = env_int("WBITS", 3)
     abits = env_int("ABITS", 8)
+    benchmark_label = env_str("BENCHMARK_LABEL", "DuQuant Benchmark")
     headless = env_str("HEADLESS", "1") == "1"
     port_base = env_int("PORT_BASE", 5600)
     output_root = Path(
@@ -357,8 +384,9 @@ def main() -> int:
     (output_root / "task_shards.json").write_text(json.dumps(task_shards, indent=2))
 
     print("========================================")
-    print("LIBERO DuQuant Benchmark Launcher")
+    print("LIBERO Benchmark Launcher")
     print("========================================")
+    print(f"Benchmark  : {benchmark_label}")
     print(f"Task suite : {task_suite}")
     print(f"Model      : {model_path}")
     print(f"Data config: {data_config}")
@@ -425,6 +453,7 @@ def main() -> int:
         model_path=model_path,
         data_config=data_config,
         gpu_list=gpu_list,
+        benchmark_label=benchmark_label,
         wbits=wbits,
         abits=abits,
         num_trials=num_trials,

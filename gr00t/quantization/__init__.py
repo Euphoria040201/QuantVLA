@@ -3,7 +3,9 @@
 from .aspq_gptq import (
     AspqGptqConfig,
     AspqGptqLinear,
+    AspqGptqRecord,
     enable_aspq_gptq_if_configured,
+    quantize_U_int8,
     solve_aspq_gptq_weight,
 )
 from .duquant_layers import (
@@ -17,7 +19,9 @@ from .duquant_layers import (
 __all__ = [
     "AspqGptqConfig",
     "AspqGptqLinear",
+    "AspqGptqRecord",
     "enable_aspq_gptq_if_configured",
+    "quantize_U_int8",
     "solve_aspq_gptq_weight",
     "DuQuantConfig",
     "DuQuantLinear",
